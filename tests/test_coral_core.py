@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from coral.config import ModelConfig
+from coral.config import CoralConfig, ModelConfig
 from coral.adapters.grid import GridAdapter
 from coral.model.coral_core import CoralCore
 from coral.training.losses import CoralLoss
@@ -91,7 +91,7 @@ def test_level_states_shape(small_config):
 def test_backward_completes(small_config):
     """loss.backward() should complete without error."""
     core = CoralCore(small_config)
-    adapter = GridAdapter(small_config, vocab_size=10, grid_height=2, grid_width=5)
+    adapter = GridAdapter(CoralConfig(model=small_config), vocab_size=10, grid_height=2, grid_width=5)
     loss_fn = CoralLoss(small_config)
 
     inputs = torch.randint(0, 10, (2, 10))
@@ -117,7 +117,7 @@ def test_backward_completes(small_config):
 def test_all_parameters_receive_gradients(small_config):
     """After backward, all backbone parameters should have non-zero gradients."""
     core = CoralCore(small_config)
-    adapter = GridAdapter(small_config, vocab_size=10, grid_height=2, grid_width=5)
+    adapter = GridAdapter(CoralConfig(model=small_config), vocab_size=10, grid_height=2, grid_width=5)
     loss_fn = CoralLoss(small_config)
 
     inputs = torch.randint(0, 10, (2, 10))
@@ -151,7 +151,7 @@ def test_pc_chain_connected(small_config):
     z_states[1], which is computed using xi_up as conditioning).
     """
     core = CoralCore(small_config)
-    adapter = GridAdapter(small_config, vocab_size=10, grid_height=2, grid_width=5)
+    adapter = GridAdapter(CoralConfig(model=small_config), vocab_size=10, grid_height=2, grid_width=5)
     loss_fn = CoralLoss(small_config)
 
     inputs = torch.randint(0, 10, (2, 10))
@@ -204,7 +204,7 @@ def test_detach_between_segments():
         use_predictive_coding=True, epsilon_min=0.01, vocab_size=10,
     )
     core = CoralCore(config)
-    adapter = GridAdapter(config, vocab_size=10, grid_height=2, grid_width=5)
+    adapter = GridAdapter(CoralConfig(model=config), vocab_size=10, grid_height=2, grid_width=5)
     loss_fn = CoralLoss(config)
 
     inputs = torch.randint(0, 10, (2, 10))

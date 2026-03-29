@@ -46,7 +46,7 @@ class ModelConfig:
     lambda_commit: float = 0.0
 
     # Adapter
-    vocab_size: int = 10  # Sudoku: digits 0-9
+    vocab_size: int = 11  # Sudoku: PAD=0, digits 1-10
 
 
 @dataclass

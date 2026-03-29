@@ -11,7 +11,7 @@ Encoding:
 Decoding:
   - Linear: d_1 → vocab_size
 
-For Sudoku: seq_len=81, vocab_size=10, grid is 9×9.
+For Sudoku: seq_len=81, vocab_size=11, grid is 9×9.
 """
 
 import math
@@ -21,30 +21,29 @@ import torch
 import torch.nn as nn
 
 from coral.adapters.base import BaseAdapter
-from coral.config import ModelConfig
+from coral.config import CoralConfig
 
 
 class GridAdapter(BaseAdapter):
     """Encoder/decoder for grid-based tasks (Sudoku, ARC, Maze).
 
     Args:
-        config: Model configuration.
-        vocab_size: Number of token types (10 for Sudoku: digits 0-9).
+        config: Top-level CoralConfig.
+        vocab_size: Number of token types (overrides config.model.vocab_size).
         grid_height: Number of rows (9 for Sudoku).
         grid_width: Number of columns (9 for Sudoku).
-        d_model: Output embedding dimension (= d_1 = 512).
     """
 
     def __init__(
         self,
-        config: ModelConfig,
+        config: CoralConfig,
         vocab_size: Optional[int] = None,
         grid_height: int = 9,
         grid_width: int = 9,
     ) -> None:
         super().__init__()
-        self.d_model = config.backbone_dim
-        self.vocab_size = vocab_size if vocab_size is not None else config.vocab_size
+        self.d_model = config.model.backbone_dim
+        self.vocab_size = vocab_size if vocab_size is not None else config.model.vocab_size
         self.grid_height = grid_height
         self.grid_width = grid_width
         self.seq_len = grid_height * grid_width

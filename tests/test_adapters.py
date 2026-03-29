@@ -10,13 +10,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from coral.config import ModelConfig
+from coral.config import CoralConfig, ModelConfig
 from coral.adapters.grid import GridAdapter
 
 
 @pytest.fixture
 def config():
-    return ModelConfig(
+    return CoralConfig(model=ModelConfig(
         n_levels=2,
         level_dims=[64, 32],
         backbone_dim=64,
@@ -24,19 +24,19 @@ def config():
         d_k=16,
         ffn_expansion=2,
         vocab_size=10,
-    )
+    ))
 
 
 def test_encode_shape(config):
     adapter = GridAdapter(config, vocab_size=10, grid_height=9, grid_width=9)
     x = torch.randint(0, 10, (4, 81))
     emb = adapter.encode(x)
-    assert emb.shape == (4, 81, config.backbone_dim)
+    assert emb.shape == (4, 81, config.model.backbone_dim)
 
 
 def test_decode_shape(config):
     adapter = GridAdapter(config, vocab_size=10, grid_height=9, grid_width=9)
-    z = torch.randn(4, 81, config.backbone_dim)
+    z = torch.randn(4, 81, config.model.backbone_dim)
     logits = adapter.decode(z)
     assert logits.shape == (4, 81, 10)
 
@@ -79,10 +79,10 @@ def test_position_embeddings_unique(config):
 
 def test_smoke_overfit_single_puzzle():
     """Adapter + simple linear decoder should overfit a single puzzle."""
-    config = ModelConfig(
+    config = CoralConfig(model=ModelConfig(
         n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
         ffn_expansion=2, vocab_size=10,
-    )
+    ))
     adapter = GridAdapter(config, vocab_size=10, grid_height=3, grid_width=3)
     opt = optim.Adam(adapter.parameters(), lr=1e-3)
 

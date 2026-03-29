@@ -28,7 +28,7 @@ def main(cfg: DictConfig) -> None:
     config = dict_to_config(cfg)
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
 
-    adapter = GridAdapter(config.model, vocab_size=config.model.vocab_size)
+    adapter = GridAdapter(config)
     core = CoralCore(config.model)
 
     checkpoint_path = cfg.get("checkpoint", None)

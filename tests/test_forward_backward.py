@@ -8,7 +8,7 @@ level 1 computation.'
 import torch
 import torch.nn as nn
 
-from coral.config import ModelConfig
+from coral.config import CoralConfig, ModelConfig
 from coral.adapters.grid import GridAdapter
 from coral.model.coral_core import CoralCore
 from coral.training.losses import CoralLoss
@@ -31,7 +31,7 @@ def make_small_model():
         lambda_pi=0.01,
         vocab_size=10,
     )
-    adapter = GridAdapter(config, vocab_size=10, grid_height=3, grid_width=3)
+    adapter = GridAdapter(CoralConfig(model=config), vocab_size=10, grid_height=3, grid_width=3)
     core = CoralCore(config)
     loss_fn = CoralLoss(config)
     return adapter, core, loss_fn, config

@@ -108,8 +108,7 @@ def main(cfg: DictConfig) -> None:
     # ---- Model ----
     log.info("Building model...")
     adapter = GridAdapter(
-        config.model,
-        vocab_size=config.model.vocab_size,
+        config,
         grid_height=9,
         grid_width=9,
     )
