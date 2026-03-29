@@ -42,7 +42,7 @@ def main(cfg: DictConfig) -> None:
 
     eval_loader, _ = create_sudoku_dataloader(
         dataset_path=config.data.dataset_path,
-        split="eval",
+        split="test",
         global_batch_size=config.training.batch_size,
         test_set_mode=True,
     )
