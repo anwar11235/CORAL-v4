@@ -70,35 +70,39 @@ class PrecisionNetwork(nn.Module):
     """Produces per-dimension precision vector π_l.
 
     Architecture: 2-layer MLP with GELU.
-        d_l → d_l → d_l, then softplus + eps_min
+        input_dim → output_dim → output_dim, then softplus + eps_min
+
+    Input is [z_lower, eps] concatenated (input_dim = 2 * d_l) so the
+    network can condition precision on prediction error rather than on the
+    level state alone. When predictions are accurate eps→0 collapses, the
+    state z_lower still provides a gradient path; the eps channel makes
+    per-dimension weighting meaningful from the start.
 
     Output is always positive (softplus) and bounded away from zero (eps_min).
     """
 
-    def __init__(self, dim: int, eps_min: float = 0.01) -> None:
+    def __init__(self, input_dim: int, output_dim: int, eps_min: float = 0.01) -> None:
         super().__init__()
         self.eps_min = eps_min
         self.net = nn.Sequential(
-            nn.Linear(dim, dim, bias=True),
+            nn.Linear(input_dim, output_dim, bias=True),
             nn.GELU(),
-            nn.Linear(dim, dim, bias=True),
+            nn.Linear(output_dim, output_dim, bias=True),
         )
-        # xavier_uniform gives non-constant output from step 1 so precision
-        # can differentiate immediately; zero weights cause dead output.
         nn.init.xavier_uniform_(self.net[0].weight)
         nn.init.zeros_(self.net[0].bias)
         nn.init.xavier_uniform_(self.net[2].weight)
         nn.init.zeros_(self.net[2].bias)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            z: [B, L, d_l]
+            x: [B, L, input_dim] — concatenation of z_lower and eps
 
         Returns:
-            pi: [B, L, d_l] — precision vector, values > eps_min.
+            pi: [B, L, output_dim] — precision vector, values > eps_min.
         """
-        return F.softplus(self.net(z)) + self.eps_min
+        return F.softplus(self.net(x)) + self.eps_min
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +161,7 @@ class PredictiveCodingModule(nn.Module):
         self.dim_upper = dim_upper
 
         self.prediction_net = PredictionNetwork(dim_upper, dim_lower)
-        self.precision_net = PrecisionNetwork(dim_lower, eps_min)
+        self.precision_net = PrecisionNetwork(input_dim=dim_lower * 2, output_dim=dim_lower, eps_min=eps_min)
         self.error_up_proj = ErrorUpProjection(dim_lower, dim_upper)
 
     def predict(self, z_upper: torch.Tensor) -> torch.Tensor:
@@ -189,7 +193,7 @@ class PredictiveCodingModule(nn.Module):
         """
         mu = self.prediction_net(z_upper)
         eps = z_lower - mu
-        pi = self.precision_net(z_lower)
+        pi = self.precision_net(torch.cat([z_lower, eps], dim=-1))
 
         # Runtime guard against precision explosion (catches wrong regulariser sign)
         assert pi.mean().item() < 100, (
