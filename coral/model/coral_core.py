@@ -157,12 +157,25 @@ class CoralCore(nn.Module):
     ) -> torch.Tensor:
         """Run backbone recursion for one level.
 
+        The backbone processes the level state without prediction interference.
+        After each backbone step, the conditioning signal is applied as a
+        residual correction in d_l space:
+
+            z_new  = project_down(backbone(project_up(z) + level_emb + ts_emb))
+            z      = z_new + gate * (conditioning - z)   # if conditioning given
+
+        The residual (conditioning - z) represents what the conditioning signal
+        expects minus what the state currently is.  When conditioning ≈ z the
+        residual is near zero, so accurate predictions cause no interference.
+        When conditioning diverges from z it actively steers the update.
+        The learnable gate (init=1) controls correction strength per level.
+
         Args:
-            z:           [B, L, d_l] — current level state
-            level_idx:   0-based level index
-            n_steps:     number of backbone applications
-            conditioning: [B, L, d_l] or [B, L, d_backbone] additive signal
-                         (top-down prediction or error from below)
+            z:            [B, L, d_l] — current level state
+            level_idx:    0-based level index
+            n_steps:      number of backbone applications
+            conditioning: [B, L, d_l] residual correction signal
+                          (top-down prediction or error from below)
 
         Returns:
             Updated z: [B, L, d_l]
@@ -171,31 +184,20 @@ class CoralCore(nn.Module):
         device = z.device
 
         for t in range(n_steps):
-            # Project up to backbone dim
+            # Build backbone input from level state + positional embeddings only
             backbone_in = level_mod.project_up(z)
+            backbone_in = backbone_in + self.level_emb(level_idx, device).unsqueeze(0).unsqueeze(0)
+            backbone_in = backbone_in + self.timescale_emb(t).unsqueeze(0).unsqueeze(0)
 
-            # Add level embedding
-            le = self.level_emb(level_idx, device)  # [d_backbone]
-            backbone_in = backbone_in + le.unsqueeze(0).unsqueeze(0)
+            # Run backbone — no conditioning in the backbone input
+            z_new = level_mod.project_down(self.backbone(backbone_in))
 
-            # Add timescale embedding
-            te = self.timescale_emb(t)  # [d_backbone]
-            backbone_in = backbone_in + te.unsqueeze(0).unsqueeze(0)
-
-            # Add conditioning signal (top-down prediction or error)
+            # Apply conditioning as a post-backbone residual correction in d_l space.
+            # conditioning must be in d_l space (callers are responsible for this).
             if conditioning is not None:
-                # conditioning may be in d_l space; project up if needed
-                if conditioning.shape[-1] != self.config.backbone_dim:
-                    cond_up = level_mod.project_up(conditioning)
-                else:
-                    cond_up = conditioning
-                backbone_in = backbone_in + self.cond_gate[level_idx] * cond_up
-
-            # Run backbone
-            backbone_out = self.backbone(backbone_in)
-
-            # Project down to level dim
-            z = level_mod.project_down(backbone_out)
+                z = z_new + self.cond_gate[level_idx] * (conditioning - z)
+            else:
+                z = z_new
 
         return z
 
