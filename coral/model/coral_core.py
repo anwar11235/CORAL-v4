@@ -61,6 +61,9 @@ class CoralOutput:
         pred_errors:       Prediction error stats per segment.
         precisions:        Precision stats per segment.
         num_segments:      Number of segments actually computed.
+        final_precision:   Level-0 precision vector from the last segment
+                           [B, L, d_0]; used for logging and precision-gated
+                           decode. None when use_predictive_coding is False.
     """
     z_states: List[torch.Tensor] = field(default_factory=list)
     all_logits: List[torch.Tensor] = field(default_factory=list)
@@ -70,6 +73,7 @@ class CoralOutput:
     pred_errors: List[Dict[str, torch.Tensor]] = field(default_factory=list)
     precisions: List[Dict[str, torch.Tensor]] = field(default_factory=list)
     num_segments: int = 0
+    final_precision: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +133,21 @@ class CoralCore(nn.Module):
         # Halting network
         self.halting = HaltingNetwork(config)
 
+        # Learnable scalar gate per level that controls conditioning strength.
+        # Initialised to 1.0 (no-op) so training starts with the full signal.
+        # The model can learn to amplify or attenuate conditioning per level.
+        self.cond_gate = nn.ParameterList([
+            nn.Parameter(torch.ones(1)) for _ in range(config.n_levels)
+        ])
+
+        # Linear projection to initialise higher-level states from the level
+        # below instead of zeros. Gives the prediction network a non-trivial
+        # starting point from step 0 so predictive coding can engage earlier.
+        self.z_init_proj = nn.ModuleList([
+            nn.Linear(config.level_dims[i - 1], config.level_dims[i], bias=False)
+            for i in range(1, config.n_levels)
+        ])
+
     def _run_level(
         self,
         z: torch.Tensor,
@@ -170,7 +189,7 @@ class CoralCore(nn.Module):
                     cond_up = level_mod.project_up(conditioning)
                 else:
                     cond_up = conditioning
-                backbone_in = backbone_in + cond_up
+                backbone_in = backbone_in + self.cond_gate[level_idx] * cond_up
 
             # Run backbone
             backbone_out = self.backbone(backbone_in)
@@ -206,15 +225,12 @@ class CoralCore(nn.Module):
         device = z1_init.device
         dtype = z1_init.dtype
 
-        # Initialise level states
+        # Initialise level states. Higher levels are seeded from the level
+        # below via z_init_proj so the prediction network has a non-trivial
+        # starting point from segment 0 instead of dead zeros.
         z_states = [z1_init]
         for i in range(1, self.n_levels):
-            # Initialise higher levels by projecting down from level below
-            z_prev = z_states[-1]
-            if self.config.level_dims[i] != self.config.level_dims[i - 1]:
-                z_init = torch.zeros(B, L, self.config.level_dims[i], device=device, dtype=dtype)
-            else:
-                z_init = torch.zeros_like(z_prev)
+            z_init = self.z_init_proj[i - 1](z_states[i - 1])
             z_states.append(z_init)
 
         output = CoralOutput()
@@ -266,11 +282,19 @@ class CoralCore(nn.Module):
                     error_signals[i + 1] = xi_up
 
             # ----------------------------------------------------------------
-            # Decode to logits for deep supervision (if decode_fn provided)
+            # Decode to logits for deep supervision (if decode_fn provided).
+            # When use_predictive_coding is True, gate z_states[0] by the
+            # level-0 precision vector so task-loss gradients flow through
+            # precision — dimensions where precision is wrong get corrected
+            # by the task loss, not just by the regulariser.
             # ----------------------------------------------------------------
             if decode_fn is not None:
-                logits = decode_fn(z_states[0])
+                z_to_decode = z_states[0]
+                if self.config.use_predictive_coding and "level_0" in seg_pi:
+                    z_to_decode = seg_pi["level_0"] * z_states[0]
+                logits = decode_fn(z_to_decode)
                 output.all_logits.append(logits)
+                output.final_precision = seg_pi.get("level_0")
 
             # ----------------------------------------------------------------
             # Halting check

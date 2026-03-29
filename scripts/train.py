@@ -244,6 +244,10 @@ def _log_precision_metrics(trainer, eval_loader, device, out_dict):
     except Exception as e:
         log.warning(f"Precision metric collection failed: {e}")
 
+    # Log learnable conditioning gate values
+    for i, gate in enumerate(trainer.core.cond_gate):
+        out_dict[f"cond_gate/level{i}"] = gate.item()
+
 
 if __name__ == "__main__":
     main()
