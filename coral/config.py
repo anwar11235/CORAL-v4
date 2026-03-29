@@ -27,7 +27,7 @@ class ModelConfig:
     # Predictive coding
     use_predictive_coding: bool = True
     lambda_pred: float = 0.1
-    lambda_pi: float = 0.01
+    lambda_pi: float = 0.001
     epsilon_min: float = 0.01  # minimum precision floor
 
     # Halting
