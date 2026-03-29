@@ -44,10 +44,10 @@ class PredictionNetwork(nn.Module):
             nn.GELU(),
             nn.Linear(2 * dim_lower, dim_lower, bias=True),
         )
-        # Initialise to near-zero predictions to avoid large initial errors
+        # Small random init on output layer; near-zero but not dead
         nn.init.normal_(self.net[0].weight, std=0.01)
         nn.init.zeros_(self.net[0].bias)
-        nn.init.zeros_(self.net[2].weight)
+        nn.init.normal_(self.net[2].weight, std=0.01)
         nn.init.zeros_(self.net[2].bias)
 
     def forward(self, z_upper: torch.Tensor) -> torch.Tensor:
@@ -83,10 +83,11 @@ class PrecisionNetwork(nn.Module):
             nn.GELU(),
             nn.Linear(dim, dim, bias=True),
         )
-        # Initialise to produce precision ≈ 1 initially (log softplus(0) ≈ 0.69 → +eps)
-        nn.init.zeros_(self.net[0].weight)
+        # xavier_uniform gives non-constant output from step 1 so precision
+        # can differentiate immediately; zero weights cause dead output.
+        nn.init.xavier_uniform_(self.net[0].weight)
         nn.init.zeros_(self.net[0].bias)
-        nn.init.zeros_(self.net[2].weight)
+        nn.init.xavier_uniform_(self.net[2].weight)
         nn.init.zeros_(self.net[2].bias)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
