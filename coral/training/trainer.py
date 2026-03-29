@@ -3,36 +3,31 @@
 Training structure:
   For each batch:
     z1 = adapter.encode(inputs)
-    z_states = [z1, z2_init, ...]
+    output = core(z1, K_max=K_max, training=True, decode_fn=adapter.decode)
 
-    For segment k in 0..K_max-1:
-      z_states, outputs = coral_core(z_states, segment_k)
-      logits = adapter.decode(z_states[0])
-      segment_loss = loss_fn(logits, labels, outputs)
-      total_loss += segment_loss
-      z_states = [z.detach() for z in z_states]   ← deep supervision boundary
-      if should_halt: break
+    For each segment in output.all_logits:
+      seg_loss = loss_fn(logits, labels, pred_errors[i], precisions[i],
+                         q_halt_logits[i], q_continue_logits[i])
+      total_loss += seg_loss
 
     total_loss.backward()
     clip_grad_norm_(params, 1.0)
     optimizer.step()
 
-The inner loop (backbone applications within a segment) stays in the same
-computation graph. Only the detach between segments prevents OOM.
+CoralCore manages the segment loop, detach boundaries, halting, and
+predictive coding internally. The trainer only handles the outer
+train/eval loop, optimiser, and loss aggregation.
 """
 
 import logging
-import time
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 
 from coral.adapters.grid import GridAdapter
 from coral.config import CoralConfig
-from coral.model.coral_core import CoralCore, CoralOutput
-from coral.model.halting import should_halt
+from coral.model.coral_core import CoralCore
 from coral.training.losses import CoralLoss
 from coral.training.optimizer import build_optimizer, build_scheduler
 
@@ -65,14 +60,11 @@ class TrainerV4:
         self.wandb_run = wandb_run
         self.device = torch.device(config.device)
 
-        # Move models to device and dtype
         dtype = torch.bfloat16 if config.training.precision == "bfloat16" else torch.float32
         self.dtype = dtype
         self.adapter = adapter.to(self.device).to(dtype)
         self.core = core.to(self.device).to(dtype)
 
-        # Build optimizer over all parameters
-        all_params = list(adapter.parameters()) + list(core.parameters())
         self.optimizer = build_optimizer(
             nn.ModuleList([adapter, core]),
             lr=config.training.learning_rate,
@@ -82,64 +74,6 @@ class TrainerV4:
         )
 
         self.step = 0
-
-    def _forward_segment(
-        self,
-        z_states: List[torch.Tensor],
-        labels: torch.Tensor,
-        is_last_segment: bool = False,
-    ) -> tuple:
-        """Run one deep supervision segment.
-
-        Returns:
-            (updated_z_states, segment_loss, breakdown, halting_info)
-        """
-        # Run each level's backbone steps
-        device = z_states[0].device
-        cfg = self.core.config
-        n_levels = cfg.n_levels
-
-        # Top-down predictions
-        predictions = [None] * n_levels
-        if cfg.use_predictive_coding:
-            for i in range(n_levels - 2, -1, -1):
-                predictions[i] = self.core.pc_modules[i].predict(z_states[i + 1])
-
-        # Bottom-up recurrence
-        seg_eps = {}
-        seg_pi = {}
-        error_signals = [None] * n_levels
-
-        for i in range(n_levels):
-            cond = None
-            if predictions[i] is not None:
-                cond = predictions[i]
-            if i > 0 and error_signals[i] is not None:
-                cond = cond + error_signals[i] if cond is not None else error_signals[i]
-
-            n_steps = self.core.level_steps[i]
-            z_states[i] = self.core._run_level(z_states[i], i, n_steps, conditioning=cond)
-
-            if cfg.use_predictive_coding and i < n_levels - 1:
-                mu, eps, pi, xi, xi_up = self.core.pc_modules[i](z_states[i], z_states[i + 1])
-                seg_eps[f"level_{i}"] = eps
-                seg_pi[f"level_{i}"] = pi
-                error_signals[i + 1] = xi_up
-
-        # Decode and compute loss
-        logits = self.adapter.decode(z_states[0])
-        h_k, q_halt_logit, q_continue_logit = self.core.halting(z_states)
-
-        seg_loss, breakdown = self.loss_fn(
-            logits=logits,
-            labels=labels,
-            pred_errors=seg_eps if seg_eps else None,
-            precisions=seg_pi if seg_pi else None,
-            q_halt_logits=q_halt_logit,
-            q_continue_logits=q_continue_logit,
-        )
-
-        return z_states, seg_loss, breakdown, (h_k, q_halt_logit, q_continue_logit)
 
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """Run one training step (one batch, all segments).
@@ -157,48 +91,31 @@ class TrainerV4:
         labels = batch["labels"].to(self.device)
 
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
-            # Encode inputs
             z1_init = self.adapter.encode(inputs)
 
-            # Initialise level states
-            B, L, _ = z1_init.shape
-            z_states = [z1_init]
-            for i in range(1, self.core.config.n_levels):
-                d_l = self.core.config.level_dims[i]
-                z_states.append(torch.zeros(B, L, d_l, device=self.device, dtype=self.dtype))
+            output = self.core(
+                z1_init,
+                K_max=self.core.config.K_max,
+                training=True,
+                decode_fn=self.adapter.decode,
+            )
 
             total_loss = torch.tensor(0.0, device=self.device)
             all_breakdowns = []
-            all_pred_errors = []
-            K_max = self.core.config.K_max
 
-            for seg in range(K_max):
-                z_states, seg_loss, breakdown, (h_k, q_halt_logit, q_cont_logit) = \
-                    self._forward_segment(z_states, labels)
-
+            for i, logits in enumerate(output.all_logits):
+                seg_loss, breakdown = self.loss_fn(
+                    logits=logits,
+                    labels=labels,
+                    pred_errors=output.pred_errors[i] if output.pred_errors else None,
+                    precisions=output.precisions[i] if output.precisions else None,
+                    q_halt_logits=output.q_halt_logits[i] if output.q_halt_logits else None,
+                    q_continue_logits=output.q_continue_logits[i] if output.q_continue_logits else None,
+                    all_pred_errors=output.pred_errors if i == len(output.all_logits) - 1 else None,
+                )
                 total_loss = total_loss + seg_loss
                 all_breakdowns.append(breakdown)
 
-                # Collect pred errors for amortisation loss
-                seg_eps = {}
-                if self.core.config.use_predictive_coding:
-                    all_pred_errors.append(seg_eps)
-
-                # Check halting
-                halt = should_halt(
-                    h_k,
-                    threshold=self.core.config.halting_threshold,
-                    exploration_prob=self.core.config.halting_exploration_prob,
-                    training=True,
-                )
-
-                # CRITICAL: detach between segments
-                z_states = [z.detach() for z in z_states]
-
-                if halt:
-                    break
-
-        # Backward and optimizer step
         self.optimizer.zero_grad()
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -208,13 +125,11 @@ class TrainerV4:
         self.optimizer.step()
         self.step += 1
 
-        # Aggregate metrics
         metrics: Dict[str, float] = {"loss/total": total_loss.item()}
         if all_breakdowns:
-            last_bd = all_breakdowns[-1]
-            for k, v in last_bd.items():
+            for k, v in all_breakdowns[-1].items():
                 metrics[k] = v.item() if isinstance(v, torch.Tensor) else v
-        metrics["train/num_segments"] = len(all_breakdowns)
+        metrics["train/num_segments"] = output.num_segments
 
         return metrics
 
@@ -241,43 +156,14 @@ class TrainerV4:
 
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
             z1 = self.adapter.encode(inputs)
-            B, L, _ = z1.shape
-            z_states = [z1]
-            for i in range(1, self.core.config.n_levels):
-                d_l = self.core.config.level_dims[i]
-                z_states.append(torch.zeros(B, L, d_l, device=self.device, dtype=self.dtype))
+            output = self.core(
+                z1,
+                K_max=K_override if K_override is not None else self.core.config.K_max,
+                training=False,
+                decode_fn=self.adapter.decode,
+            )
 
-            K_max = K_override if K_override is not None else self.core.config.K_max
-            num_segs = 0
-
-            for seg in range(K_max):
-                # Top-down predictions
-                n_levels = self.core.config.n_levels
-                predictions = [None] * n_levels
-                error_signals = [None] * n_levels
-                if self.core.config.use_predictive_coding:
-                    for i in range(n_levels - 2, -1, -1):
-                        predictions[i] = self.core.pc_modules[i].predict(z_states[i + 1])
-
-                for i in range(n_levels):
-                    cond = predictions[i]
-                    if i > 0 and error_signals[i] is not None:
-                        cond = cond + error_signals[i] if cond is not None else error_signals[i]
-                    n_steps = self.core.level_steps[i]
-                    z_states[i] = self.core._run_level(z_states[i], i, n_steps, conditioning=cond)
-                    if self.core.config.use_predictive_coding and i < n_levels - 1:
-                        _, _, _, _, xi_up = self.core.pc_modules[i](z_states[i], z_states[i + 1])
-                        error_signals[i + 1] = xi_up
-
-                h_k, _, _ = self.core.halting(z_states)
-                num_segs = seg + 1
-                z_states = [z.detach() for z in z_states]
-
-                if K_override is None and should_halt(h_k, threshold=self.core.config.halting_threshold, training=False, exploration_prob=0.0):
-                    break
-
-        # Compute accuracy
-        logits = self.adapter.decode(z_states[0])
+        logits = output.all_logits[-1] if output.all_logits else self.adapter.decode(output.z_states[0])
         preds = logits.argmax(dim=-1)  # [B, L]
 
         mask = labels != -100
@@ -290,7 +176,7 @@ class TrainerV4:
         return {
             "eval/exact_accuracy": exact_acc,
             "eval/token_accuracy": token_acc,
-            "eval/avg_halting_step": float(num_segs),
+            "eval/avg_halting_step": float(output.num_segments),
         }
 
     def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None) -> None:
