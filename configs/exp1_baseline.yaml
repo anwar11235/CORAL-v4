@@ -59,14 +59,17 @@ training:
   full_inner_backprop: true
 
   # Evaluation
-  eval_every: 500
-  pareto_eval_every: 5000
+  eval_every: 500          # quick eval: first quick_eval_samples puzzles, full K_max
+  pareto_eval_every: 5000  # full Pareto eval: all puzzles, K=1,2,4,8,16
+  quick_eval_samples: 100
   log_every: 50
 
   # Optimizer: try fused_adam_atan2 first, fall back to adamw
   optimizer: adamw
 
-  # torch.compile: use dynamic=False for fixed L=81
+  # torch.compile wraps core.backbone only (not the full CoralCore).
+  # dynamic=False: correct for Sudoku (fixed seq_len=81). Set true for
+  # variable-length tasks like ARC where grid size varies per puzzle.
   compile_model: false
   compile_dynamic: false
 
@@ -75,7 +78,7 @@ data:
   dataset_path: data/sudoku_extreme_1k
   augmentation_factor: 1000
   eval_size: 1000
-  num_workers: 1
+  num_workers: 4
   seq_len: 81
 
 wandb:

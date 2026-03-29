@@ -122,8 +122,8 @@ def main(cfg: DictConfig) -> None:
 
     # ---- torch.compile (optional) ----
     if config.training.compile_model:
-        log.info("Compiling model with torch.compile...")
-        core = torch.compile(core, dynamic=config.training.compile_dynamic)
+        log.info("Compiling backbone with torch.compile...")
+        core.backbone = torch.compile(core.backbone, dynamic=config.training.compile_dynamic)
 
     # ---- Trainer ----
     trainer = TrainerV4(
@@ -171,7 +171,7 @@ def main(cfg: DictConfig) -> None:
                     dataloader=eval_loader,
                     device=device,
                     dtype=torch.bfloat16,
-                    max_puzzles=100,
+                    max_puzzles=config.training.quick_eval_samples,
                 )
                 if wandb_run is not None:
                     wandb_run.log(quick_metrics, step=step)
