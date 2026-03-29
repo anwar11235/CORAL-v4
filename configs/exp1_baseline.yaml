@@ -39,7 +39,7 @@ model:
   lambda_commit: 0.0
 
   # Adapter
-  vocab_size: 10
+  vocab_size: 11
 
 training:
   epochs: 20000
