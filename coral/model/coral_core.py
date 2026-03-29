@@ -61,9 +61,6 @@ class CoralOutput:
         pred_errors:       Prediction error stats per segment.
         precisions:        Precision stats per segment.
         num_segments:      Number of segments actually computed.
-        final_precision:   Level-0 precision vector from the last segment
-                           [B, L, d_0]; used for logging and precision-gated
-                           decode. None when use_predictive_coding is False.
     """
     z_states: List[torch.Tensor] = field(default_factory=list)
     all_logits: List[torch.Tensor] = field(default_factory=list)
@@ -73,7 +70,6 @@ class CoralOutput:
     pred_errors: List[Dict[str, torch.Tensor]] = field(default_factory=list)
     precisions: List[Dict[str, torch.Tensor]] = field(default_factory=list)
     num_segments: int = 0
-    final_precision: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -291,12 +287,8 @@ class CoralCore(nn.Module):
             # by the task loss, not just by the regulariser.
             # ----------------------------------------------------------------
             if decode_fn is not None:
-                z_to_decode = z_states[0]
-                if self.config.use_predictive_coding and "level_0" in seg_pi:
-                    z_to_decode = seg_pi["level_0"] * z_states[0]
-                logits = decode_fn(z_to_decode)
+                logits = decode_fn(z_states[0])
                 output.all_logits.append(logits)
-                output.final_precision = seg_pi.get("level_0")
 
             # ----------------------------------------------------------------
             # Halting check

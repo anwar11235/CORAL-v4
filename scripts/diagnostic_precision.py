@@ -1,9 +1,9 @@
 """Quick diagnostic: verify precision network produces varying output after training.
 
-Trains for 200 steps and reports whether precision is differentiating.
-Every 50 steps prints: precision mean/std/min/max, prediction error mean, task loss.
+Trains for 1000 steps and reports whether precision is differentiating.
+Every 100 steps prints: precision mean/std/min/max, prediction error mean, task loss.
 
-Exit code 0 if precision std > 0.01 at step 200, exit code 1 otherwise.
+Exit code 0 if precision std > 0.01 at step 1000, exit code 1 otherwise.
 
 Usage:
     python scripts/diagnostic_precision.py
@@ -25,9 +25,9 @@ from coral.training.trainer import TrainerV4
 
 logging.basicConfig(level=logging.WARNING, format="%(message)s")
 
-STEPS = 200
+STEPS = 1000
 BATCH_SIZE = 64
-LOG_EVERY = 50
+LOG_EVERY = 100
 PASS_THRESHOLD = 0.01
 
 
