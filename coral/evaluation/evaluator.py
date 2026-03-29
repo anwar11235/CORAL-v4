@@ -94,8 +94,8 @@ def evaluate_accuracy(
                     ):
                         break
 
-            logits = adapter.decode(z_states[0])
-            preds = logits.argmax(dim=-1)
+                logits = adapter.decode(z_states[0])
+                preds = logits.argmax(dim=-1)
 
             mask = labels != IGNORE_LABEL_ID
             correct = (preds == labels) & mask
