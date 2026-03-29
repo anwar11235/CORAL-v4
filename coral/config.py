@@ -68,7 +68,8 @@ class TrainingConfig:
     full_inner_backprop: bool = True
 
     # Evaluation
-    eval_every: int = 500
+    eval_every: int = 500        # quick eval (first 100 puzzles, full K_max)
+    pareto_eval_every: int = 5000  # full Pareto eval (all puzzles, K=1..16)
     log_every: int = 50
 
     # Optimizer selection

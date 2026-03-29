@@ -20,6 +20,7 @@ def evaluate_accuracy(
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
     K_override: Optional[int] = None,
+    max_puzzles: Optional[int] = None,
 ) -> Dict[str, float]:
     """Evaluate exact and token accuracy on a full evaluation dataset.
 
@@ -30,6 +31,7 @@ def evaluate_accuracy(
         device:      Compute device.
         dtype:       Forward pass dtype.
         K_override:  If provided, force exactly K segments.
+        max_puzzles: If provided, stop after this many puzzles (quick eval).
 
     Returns:
         Dict with "eval/exact_accuracy", "eval/token_accuracy",
@@ -105,6 +107,9 @@ def evaluate_accuracy(
             token_total += mask.sum().item()
             total_puzzles += B
             total_segments += num_segs
+
+            if max_puzzles is not None and total_puzzles >= max_puzzles:
+                break
 
     return {
         "eval/exact_accuracy": exact_correct / max(total_puzzles, 1),

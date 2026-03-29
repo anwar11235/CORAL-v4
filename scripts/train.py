@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from coral.adapters.grid import GridAdapter
 from coral.config import CoralConfig, ModelConfig, TrainingConfig, DataConfig, WandbConfig
 from coral.data.sudoku_dataset import create_sudoku_dataloader
+from coral.evaluation.evaluator import evaluate_accuracy
 from coral.evaluation.pareto import evaluate_pareto
 from coral.model.coral_core import CoralCore
 from coral.training.losses import CoralLoss
@@ -161,9 +162,27 @@ def main(cfg: DictConfig) -> None:
                     + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
                 )
 
-            # Evaluation
+            # Quick eval — first 100 puzzles, full K_max
             if step % config.training.eval_every == 0:
-                log.info(f"Running evaluation at step {step}...")
+                log.info(f"Running quick eval at step {step}...")
+                quick_metrics = evaluate_accuracy(
+                    adapter=trainer.adapter,
+                    core=trainer.core,
+                    dataloader=eval_loader,
+                    device=device,
+                    dtype=torch.bfloat16,
+                    max_puzzles=100,
+                )
+                if wandb_run is not None:
+                    wandb_run.log(quick_metrics, step=step)
+                log.info(
+                    f"[QUICK EVAL] step={step} | "
+                    + " | ".join(f"{k}={v:.4f}" for k, v in quick_metrics.items())
+                )
+
+            # Full Pareto eval — all puzzles, K=1..16
+            if step % config.training.pareto_eval_every == 0:
+                log.info(f"Running full Pareto eval at step {step}...")
                 pareto_results = evaluate_pareto(
                     adapter=trainer.adapter,
                     core=trainer.core,
@@ -171,15 +190,11 @@ def main(cfg: DictConfig) -> None:
                     device=device,
                     dtype=torch.bfloat16,
                 )
-
-                # Log precision dynamics
                 _log_precision_metrics(trainer, eval_loader, device, pareto_results)
-
                 if wandb_run is not None:
                     wandb_run.log(pareto_results, step=step)
-
                 log.info(
-                    f"[EVAL] step={step} | "
+                    f"[PARETO EVAL] step={step} | "
                     + " | ".join(f"{k}={v:.4f}" for k, v in pareto_results.items())
                 )
 
