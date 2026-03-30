@@ -96,6 +96,15 @@ class CoralCore(nn.Module):
         self.T = config.timescale_base
         self.K_max = config.K_max
 
+        # Determine effective operating mode with backward compatibility.
+        # Old-style configs set use_predictive_coding=True but do not set mode,
+        # so they would get mode="baseline" by default.  We promote those to
+        # "pc_only" so existing configs and tests keep working unchanged.
+        if config.mode == "baseline" and config.use_predictive_coding:
+            self.effective_mode = "pc_only"
+        else:
+            self.effective_mode = config.mode
+
         # Compute inner steps per level: level i (0-indexed) gets T^(n_levels-1-i) steps
         # Level 0 (fastest) = T^(n_levels-1) steps, Level n_levels-1 (slowest) = T^0=1 step
         self.level_steps = [
@@ -233,58 +242,71 @@ class CoralCore(nn.Module):
 
         output = CoralOutput()
 
-        for seg in range(K_max):
-            # ----------------------------------------------------------------
-            # Top-down pass: compute predictions for each level
-            # ----------------------------------------------------------------
-            predictions = [None] * self.n_levels  # predictions[i] = mu for level i
-            if self.config.use_predictive_coding:
-                for i in range(self.n_levels - 2, -1, -1):  # from N-2 down to 0
-                    predictions[i] = self.pc_modules[i].predict(z_states[i + 1])
+        if self.effective_mode == "full":
+            raise NotImplementedError(
+                "mode='full' (PC + crystallisation) is not yet implemented. "
+                "It will be wired in Session 5."
+            )
 
-            # ----------------------------------------------------------------
-            # Bottom-up pass: recurrence + error propagation
-            # CRITICAL: all backbone calls are in the SAME computation graph
-            # ----------------------------------------------------------------
+        for seg in range(K_max):
             seg_eps: Dict[str, torch.Tensor] = {}
             seg_pi: Dict[str, torch.Tensor] = {}
-            error_signals = [None] * self.n_levels  # xi_up projected into each level
 
-            # Process levels from fastest (0) to slowest (n_levels-1)
-            for i in range(self.n_levels):
-                # Conditioning = top-down prediction + error from level below
-                cond = None
-                if predictions[i] is not None:
-                    cond = predictions[i]
-                if i > 0 and error_signals[i] is not None:
-                    if cond is not None:
-                        # error_signals[i] is already in d_{i} space
-                        # Need to project to d_{i} for adding to cond
-                        cond = cond + error_signals[i]
-                    else:
-                        cond = error_signals[i]
+            if self.effective_mode == "baseline":
+                # ------------------------------------------------------------
+                # Baseline mode: no predictive coding, level 0 only.
+                # Run T inner steps at level 0; ignore all higher levels.
+                # This is the clean no-PC path used for Phase 1 experiments.
+                # ------------------------------------------------------------
+                z_states[0] = self._run_level(
+                    z_states[0], 0, self.T, conditioning=None
+                )
 
-                # Run backbone recursion for this level
-                n_steps = self.level_steps[i]
-                z_states[i] = self._run_level(z_states[i], i, n_steps, conditioning=cond)
+            else:
+                # effective_mode == "pc_only" (or legacy use_predictive_coding=True)
+                # ----------------------------------------------------------------
+                # Top-down pass: compute predictions for each level
+                # ----------------------------------------------------------------
+                predictions = [None] * self.n_levels  # predictions[i] = mu for level i
+                if self.config.use_predictive_coding:
+                    for i in range(self.n_levels - 2, -1, -1):  # from N-2 down to 0
+                        predictions[i] = self.pc_modules[i].predict(z_states[i + 1])
 
-                # Compute precision-weighted error and project upward
-                if self.config.use_predictive_coding and i < self.n_levels - 1:
-                    mu, eps, pi, xi, xi_up = self.pc_modules[i](z_states[i], z_states[i + 1])
+                # ----------------------------------------------------------------
+                # Bottom-up pass: recurrence + error propagation
+                # CRITICAL: all backbone calls are in the SAME computation graph
+                # ----------------------------------------------------------------
+                error_signals = [None] * self.n_levels  # xi_up projected into each level
 
-                    # Store for loss computation
-                    seg_eps[f"level_{i}"] = eps
-                    seg_pi[f"level_{i}"] = pi
+                # Process levels from fastest (0) to slowest (n_levels-1)
+                for i in range(self.n_levels):
+                    # Conditioning = top-down prediction + error from level below
+                    cond = None
+                    if predictions[i] is not None:
+                        cond = predictions[i]
+                    if i > 0 and error_signals[i] is not None:
+                        if cond is not None:
+                            cond = cond + error_signals[i]
+                        else:
+                            cond = error_signals[i]
 
-                    # xi_up goes into level i+1's input next segment
-                    error_signals[i + 1] = xi_up
+                    # Run backbone recursion for this level
+                    n_steps = self.level_steps[i]
+                    z_states[i] = self._run_level(z_states[i], i, n_steps, conditioning=cond)
+
+                    # Compute precision-weighted error and project upward
+                    if self.config.use_predictive_coding and i < self.n_levels - 1:
+                        mu, eps, pi, xi, xi_up = self.pc_modules[i](z_states[i], z_states[i + 1])
+
+                        # Store for loss computation
+                        seg_eps[f"level_{i}"] = eps
+                        seg_pi[f"level_{i}"] = pi
+
+                        # xi_up goes into level i+1's input next segment
+                        error_signals[i + 1] = xi_up
 
             # ----------------------------------------------------------------
             # Decode to logits for deep supervision (if decode_fn provided).
-            # When use_predictive_coding is True, gate z_states[0] by the
-            # level-0 precision vector so task-loss gradients flow through
-            # precision — dimensions where precision is wrong get corrected
-            # by the task loss, not just by the regulariser.
             # ----------------------------------------------------------------
             if decode_fn is not None:
                 logits = decode_fn(z_states[0])

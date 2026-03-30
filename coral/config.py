@@ -27,7 +27,7 @@ class ModelConfig:
     # Predictive coding
     use_predictive_coding: bool = True
     lambda_pred: float = 0.1
-    lambda_pi: float = 0.001
+    lambda_pi: float = 0.001  # DEPRECATED in v4.2: precision regulariser removed; kept for backward compat
     epsilon_min: float = 0.01  # minimum precision floor
 
     # Halting
@@ -43,7 +43,31 @@ class ModelConfig:
     use_amort: bool = False
     lambda_amort: float = 0.0
     lambda_crystal: float = 0.0
-    lambda_commit: float = 0.0
+    lambda_commit: float = 0.25  # commitment loss weight (v4.2 crystallisation)
+
+    # v4.2 additions: multi-headed codebook
+    codebook_heads: int = 8
+    codebook_entries_per_head: int = 32
+
+    # v4.2 additions: crystallisation / convergence
+    tau_converge: float = 0.01       # convergence velocity threshold for crystallisation
+    tau_decrystallise: float = 0.05  # velocity threshold for de-crystallisation
+    n_stable: int = 2                # stable segments required before crystallisation
+
+    # v4.2 additions: losses and precision
+    lambda_dis: float = 0.01         # disentanglement loss weight
+    precision_momentum: float = 0.99  # EMA momentum for running-statistics precision
+
+    # v4.2 additions: attention and mode
+    use_local_attention_bias: bool = True  # learned row/col/box attention bias scalars
+
+    # Operating mode — controls which forward path is used:
+    #   "baseline" : no predictive coding, level-1 only, T inner steps per segment
+    #   "pc_only"  : predictive coding with running-statistics precision (v4.1 behaviour)
+    #   "full"     : PC + multi-headed crystallisation (v4.2 target; Session 5+)
+    # NOTE: if mode="baseline" but use_predictive_coding=True (old-style configs),
+    #       CoralCore automatically uses "pc_only" for backward compatibility.
+    mode: str = "baseline"
 
     # Adapter
     vocab_size: int = 11  # Sudoku: PAD=0, digits 1-10
