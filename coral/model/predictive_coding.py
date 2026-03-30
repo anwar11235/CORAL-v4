@@ -228,7 +228,7 @@ def precision_weighted_prediction_loss(
     Returns:
         Scalar loss.
     """
-    return 0.5 * (pi * eps.pow(2)).sum(dim=-1).mean()
+    return 0.5 * (pi * eps.pow(2)).mean(dim=-1).mean()
 
 
 def precision_regulariser(pi: torch.Tensor) -> torch.Tensor:
@@ -247,4 +247,4 @@ def precision_regulariser(pi: torch.Tensor) -> torch.Tensor:
     Returns:
         Scalar loss.
     """
-    return 0.5 * torch.log(pi).pow(2).sum(dim=-1).mean()
+    return 0.5 * torch.log(pi).pow(2).mean(dim=-1).mean()
