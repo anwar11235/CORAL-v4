@@ -59,7 +59,10 @@ class ModelConfig:
     precision_momentum: float = 0.99  # EMA momentum for running-statistics precision
 
     # v4.2 additions: attention and mode
-    use_local_attention_bias: bool = True  # learned row/col/box attention bias scalars
+    # Default False for backward compat: existing configs/tests that omit this field
+    # must not inherit unused parameters in the backbone. Explicitly set True in v4.2
+    # experiment configs to enable the learned row/col/box attention bias.
+    use_local_attention_bias: bool = False  # learned row/col/box attention bias scalars
 
     # Operating mode — controls which forward path is used:
     #   "baseline" : no predictive coding, level-1 only, T inner steps per segment

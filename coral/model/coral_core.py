@@ -159,6 +159,7 @@ class CoralCore(nn.Module):
         level_idx: int,
         n_steps: int,
         conditioning: Optional[torch.Tensor] = None,
+        attention_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run backbone recursion for one level.
 
@@ -176,11 +177,13 @@ class CoralCore(nn.Module):
         The learnable gate (init=1) controls correction strength per level.
 
         Args:
-            z:            [B, L, d_l] — current level state
-            level_idx:    0-based level index
-            n_steps:      number of backbone applications
-            conditioning: [B, L, d_l] residual correction signal
-                          (top-down prediction or error from below)
+            z:              [B, L, d_l] — current level state
+            level_idx:      0-based level index
+            n_steps:        number of backbone applications
+            conditioning:   [B, L, d_l] residual correction signal
+                            (top-down prediction or error from below)
+            attention_bias: Optional [L, L] float tensor added to attention
+                            logits in every backbone step (v4.2 local bias).
 
         Returns:
             Updated z: [B, L, d_l]
@@ -195,7 +198,9 @@ class CoralCore(nn.Module):
             backbone_in = backbone_in + self.timescale_emb(t).unsqueeze(0).unsqueeze(0)
 
             # Run backbone — no conditioning in the backbone input
-            z_new = level_mod.project_down(self.backbone(backbone_in))
+            z_new = level_mod.project_down(
+                self.backbone(backbone_in, attention_bias=attention_bias)
+            )
 
             # Apply conditioning as a post-backbone residual correction in d_l space.
             # conditioning must be in d_l space (callers are responsible for this).
@@ -212,15 +217,23 @@ class CoralCore(nn.Module):
         K_max: Optional[int] = None,
         training: bool = True,
         decode_fn: Optional[callable] = None,
+        attention_masks: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> CoralOutput:
         """Run the full reasoning loop.
 
         Args:
-            z1_init:   [B, L, d_1] — initial level-1 state from adapter
-            K_max:     Override maximum segments (defaults to config.K_max)
-            training:  Training vs eval mode (affects halting behaviour)
-            decode_fn: Optional callable([B, L, d_1]) → [B, L, vocab_size]
-                       used to produce logits for deep supervision.
+            z1_init:         [B, L, d_1] — initial level-1 state from adapter
+            K_max:           Override maximum segments (defaults to config.K_max)
+            training:        Training vs eval mode (affects halting behaviour)
+            decode_fn:       Optional callable([B, L, d_1]) → [B, L, vocab_size]
+                             used to produce logits for deep supervision.
+            attention_masks: Optional tuple of 3 binary [L, L] tensors
+                             (same_row, same_col, same_box) from the adapter.
+                             When provided and config.use_local_attention_bias
+                             is True, the backbone's learned scalars are applied
+                             to build a combined [L, L] attention bias used in
+                             every backbone call this forward pass.
+                             Pass None (default) to skip — backward compatible.
 
         Returns:
             CoralOutput with all intermediate states and metrics.
@@ -231,6 +244,17 @@ class CoralCore(nn.Module):
         B, L, _ = z1_init.shape
         device = z1_init.device
         dtype = z1_init.dtype
+
+        # Compute combined attention bias from structural masks (once per forward).
+        # The 3 binary masks are static; only the learned scalars change during training.
+        attn_bias: Optional[torch.Tensor] = None
+        if attention_masks is not None and self.config.use_local_attention_bias:
+            row_mask, col_mask, box_mask = attention_masks
+            attn_bias = (
+                self.backbone.row_bias * row_mask.to(device)
+                + self.backbone.col_bias * col_mask.to(device)
+                + self.backbone.box_bias * box_mask.to(device)
+            )
 
         # Initialise level states. Higher levels are seeded from the level
         # below via z_init_proj so the prediction network has a non-trivial
@@ -259,7 +283,7 @@ class CoralCore(nn.Module):
                 # This is the clean no-PC path used for Phase 1 experiments.
                 # ------------------------------------------------------------
                 z_states[0] = self._run_level(
-                    z_states[0], 0, self.T, conditioning=None
+                    z_states[0], 0, self.T, conditioning=None, attention_bias=attn_bias
                 )
 
             else:
@@ -292,7 +316,9 @@ class CoralCore(nn.Module):
 
                     # Run backbone recursion for this level
                     n_steps = self.level_steps[i]
-                    z_states[i] = self._run_level(z_states[i], i, n_steps, conditioning=cond)
+                    z_states[i] = self._run_level(
+                        z_states[i], i, n_steps, conditioning=cond, attention_bias=attn_bias
+                    )
 
                     # Compute precision-weighted error and project upward
                     if self.config.use_predictive_coding and i < self.n_levels - 1:

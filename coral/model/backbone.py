@@ -128,6 +128,10 @@ class RotaryAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
+        # Cast mask to match query dtype — required when running bfloat16 forward
+        # and the bias was built from float32 binary masks.
+        if mask is not None:
+            mask = mask.to(q.dtype)
         attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
         # [B, H, L, dk] → [B, L, D]
         attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
@@ -195,6 +199,10 @@ class CoralBackbone(nn.Module):
     Level-specific behaviour is induced by additive inputs (level_emb,
     timescale_emb, prediction/error signals) passed in at call time.
 
+    v4.2: 3 learnable scalar attention bias parameters (row_bias, col_bias,
+    box_bias) weight the structural adjacency masks provided by the adapter.
+    When attention_bias is None (default) the backbone behaves identically to v4.1.
+
     Input/output shape: [B, L, d_model] where d_model=512.
     """
 
@@ -208,18 +216,37 @@ class CoralBackbone(nn.Module):
             for _ in range(config.backbone_layers)
         ])
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # v4.2: learnable scalars for local structure attention bias.
+        # Only registered when use_local_attention_bias=True so that configs that
+        # do not opt-in are not given unused parameters (which would break gradient
+        # checks in existing tests).  Initialised to 0.0 so that at the start of
+        # training the backbone is identical to the no-bias baseline.
+        self.use_local_attention_bias = getattr(config, "use_local_attention_bias", False)
+        if self.use_local_attention_bias:
+            self.row_bias = nn.Parameter(torch.zeros(1))
+            self.col_bias = nn.Parameter(torch.zeros(1))
+            self.box_bias = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
-            x:    [B, L, d_model] — input (already includes level_emb + timescale_emb
-                                    as additive signals from the caller).
-            mask: Optional attention mask.
+            x:              [B, L, d_model] — input (already includes level_emb +
+                            timescale_emb as additive signals from the caller).
+            attention_bias: Optional [L, L] float tensor that is added to the
+                            raw attention logits before softmax inside every
+                            transformer layer.  Broadcastable across batch and
+                            head dimensions by PyTorch SDPA.  Pass None (default)
+                            to skip entirely — backward compatible with v4.1.
 
         Returns:
             [B, L, d_model]
         """
         for layer in self.layers:
-            x = layer(x, mask=mask)
+            x = layer(x, mask=attention_bias)
         return x
 
 

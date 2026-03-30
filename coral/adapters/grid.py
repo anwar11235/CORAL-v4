@@ -15,7 +15,7 @@ For Sudoku: seq_len=81, vocab_size=11, grid is 9×9.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -116,3 +116,47 @@ class GridAdapter(BaseAdapter):
             [B, seq_len] integer predictions.
         """
         return self.decode(z).argmax(dim=-1)
+
+    def build_attention_masks(
+        self,
+        device: Optional[Union[torch.device, str]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build binary structural adjacency masks for the grid.
+
+        Returns three boolean-valued float tensors of shape [L, L] where
+        L = grid_height * grid_width.  Each mask[i, j] is 1.0 if positions
+        i and j share the corresponding structural property, 0.0 otherwise.
+
+        These are used by the backbone to weight its 3 learnable attention
+        bias scalars (row_bias, col_bias, box_bias).  The masks are static
+        (depend only on grid shape) so they should be computed once per
+        forward pass and reused across segments.
+
+        Box size is grid_height // 3 × grid_width // 3 (i.e. 3×3 for Sudoku).
+
+        Args:
+            device: Target device.  Defaults to the device of the adapter's
+                    registered buffers (self.row_indices.device).
+
+        Returns:
+            same_row: [L, L] — 1.0 where i and j are in the same row.
+            same_col: [L, L] — 1.0 where i and j are in the same column.
+            same_box: [L, L] — 1.0 where i and j are in the same 3×3 box.
+        """
+        if device is None:
+            device = self.row_indices.device
+
+        row = self.row_indices  # [L]
+        col = self.col_indices  # [L]
+
+        # Box index: (row // box_h) * n_box_cols + (col // box_w)
+        box_h = self.grid_height // 3
+        box_w = self.grid_width // 3
+        n_box_cols = self.grid_width // box_w
+        box_idx = (row // box_h) * n_box_cols + (col // box_w)  # [L]
+
+        same_row = (row.unsqueeze(1) == row.unsqueeze(0)).float().to(device)  # [L, L]
+        same_col = (col.unsqueeze(1) == col.unsqueeze(0)).float().to(device)  # [L, L]
+        same_box = (box_idx.unsqueeze(1) == box_idx.unsqueeze(0)).float().to(device)  # [L, L]
+
+        return same_row, same_col, same_box

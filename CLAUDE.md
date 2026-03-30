@@ -65,6 +65,42 @@ be implemented.
 `PrecisionNetwork(dim=...)` API mismatch, not caused by Session 1 changes).
 All 35 previously-passing tests continue to pass.
 
+### Session 2 — Backbone Local Attention Bias (2026-03-30)
+
+**What was done:**
+1. **`coral/config.py`** — Changed `use_local_attention_bias` default from `True` → `False`
+   for backward compat with existing tests (configs that enable the feature set it explicitly).
+
+2. **`coral/model/backbone.py`** — Added local attention bias support to `CoralBackbone`:
+   - 3 learnable scalars `row_bias`, `col_bias`, `box_bias` (`nn.Parameter`, init=0.0)
+     registered **only** when `use_local_attention_bias=True`.
+   - `forward(x, attention_bias=None)` accepts an optional pre-combined `[L, L]` float
+     additive bias that is passed to every transformer layer's SDPA call.
+   - `RotaryAttention.forward` casts `mask` to query dtype before SDPA (bfloat16 compat).
+
+3. **`coral/adapters/grid.py`** — Added `build_attention_masks(device=None)`:
+   - Returns 3 binary `[L, L]` float tensors: `same_row`, `same_col`, `same_box`.
+   - Box size is `(grid_height // 3) × (grid_width // 3)` (3×3 for Sudoku).
+   - Masks are static (no learnable params); backbone applies its scalars externally.
+
+4. **`coral/model/coral_core.py`** — Wired attention masks through the forward pass:
+   - `forward(..., attention_masks=None)` accepts the 3-tuple from the adapter.
+   - Combined bias computed once per forward call (not per segment):
+     `attn_bias = backbone.row_bias * row + backbone.col_bias * col + backbone.box_bias * box`
+   - `_run_level(..., attention_bias=None)` passes bias to every `backbone(...)` call.
+   - Skipped entirely when `attention_masks=None` or `use_local_attention_bias=False`.
+
+5. **`tests/test_local_attention_bias.py`** — 11 new tests (all pass):
+   - Mask shape, symmetry, binary values, diagonal-ones
+   - Same-row / same-col / same-box structural correctness for 9×9 Sudoku
+   - Backbone: bias params exist when enabled; init=0.0
+   - Backbone: output identical with `attention_bias=None` vs no arg (backward compat)
+   - Backbone: output changes with non-zero bias; bias params get gradients
+   - CoralCore: integration test with masks; no-masks path unchanged
+
+**Test status:** 49/51 pass (2 pre-existing `PrecisionNetwork` failures unchanged).
+All 35 previously-passing tests continue to pass.
+
 Key v4.2 changes from v4.1:
 - Learned precision network → running-statistics precision (EMA, no parameters)
 - Learned recognition network → convergence-driven crystallisation (velocity monitoring, no parameters)
