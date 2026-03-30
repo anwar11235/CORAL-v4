@@ -1,16 +1,20 @@
-"""CORAL v4 — Precision-weighted predictive coding.
+"""CORAL v4.2 — Precision-weighted predictive coding.
+
+v4.2 design change: learned PrecisionNetwork replaced by RunningPrecision.
+Eight failed attempts (see handoff note) established that learned precision
+via backprop collapses to uniform output and adds training instability.
+RunningPrecision uses running EMA statistics of the prediction error variance
+and has ZERO learnable parameters — precision is a constant multiplier for
+gradient purposes.
 
 Implements the core free energy mechanism:
-  1. PredictionNetwork: top-down prediction μ_l = f(z_{l+1})
-  2. PrecisionNetwork: per-dimension precision π_l = g(z_l)
-  3. PredictiveCodingModule: combines prediction, error, and precision
+  1. PredictionNetwork:  top-down prediction  μ_l = f(z_{l+1})
+  2. RunningPrecision:   per-dim precision    π_l = 1 / (EMA_var + eps)  [no params]
+  3. PredictiveCodingModule: combines prediction, error, precision
 
-CRITICAL: precision regulariser uses the symmetric log-normal prior:
-    L_π = (λ_π / 2) * (log π)²
-This has its minimum at π=1. The naive -½ log π causes unbounded precision
-growth and is NOT used here.
-
-Runtime assertion: assert pi.mean() < 100  (catches sign bugs early)
+CRITICAL: precision is treated as a constant in the gradient graph.
+RunningPrecision.update() is decorated with @torch.no_grad() and the
+ema_var buffer does not have requires_grad=True.
 """
 
 from typing import Tuple
@@ -62,47 +66,76 @@ class PredictionNetwork(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Precision network: per-dimension precision vector
+# Running-statistics precision (ZERO learnable parameters)
 # ---------------------------------------------------------------------------
 
 
-class PrecisionNetwork(nn.Module):
-    """Produces per-dimension precision vector π_l.
+class RunningPrecision(nn.Module):
+    """Per-dimension precision via running EMA of prediction error variance.
 
-    Architecture: 2-layer MLP with GELU.
-        input_dim → output_dim → output_dim, then softplus + eps_min
+    v4.2 replacement for the learned PrecisionNetwork.  Precision is
+    estimated as the reciprocal of the exponential-moving-average variance
+    of the prediction error, tracked independently per feature dimension.
 
-    Input is [z_lower, eps] concatenated (input_dim = 2 * d_l) so the
-    network can condition precision on prediction error rather than on the
-    level state alone. When predictions are accurate eps→0 collapses, the
-    state z_lower still provides a gradient path; the eps channel makes
-    per-dimension weighting meaningful from the start.
+    Key properties:
+    - Zero learnable parameters (ema_var is a buffer, not a Parameter).
+    - Precision is a constant for gradient purposes (update is @no_grad).
+    - Initialised to ones → precision ≈ 1/(1+eps) ≈ 0.99 everywhere.
+    - High-error dimensions get lower precision (higher variance → lower 1/var).
 
-    Output is always positive (softplus) and bounded away from zero (eps_min).
+    Args:
+        dim:      Feature dimension d_l.
+        momentum: EMA smoothing factor (0.99 → slow update, stable statistics).
+        eps:      Minimum variance floor (prevents precision from blowing up).
     """
 
-    def __init__(self, input_dim: int, output_dim: int, eps_min: float = 0.01) -> None:
+    def __init__(self, dim: int, momentum: float = 0.99, eps: float = 0.01) -> None:
         super().__init__()
-        self.eps_min = eps_min
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, output_dim, bias=True),
-            nn.GELU(),
-            nn.Linear(output_dim, output_dim, bias=True),
-        )
-        nn.init.xavier_uniform_(self.net[0].weight)
-        nn.init.zeros_(self.net[0].bias)
-        nn.init.xavier_uniform_(self.net[2].weight)
-        nn.init.zeros_(self.net[2].bias)
+        self.dim = dim
+        self.momentum = momentum
+        self.eps = eps
+        # Buffer: not a learnable parameter; survives model.state_dict() checkpointing.
+        self.register_buffer("ema_var", torch.ones(dim))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
+    @torch.no_grad()
+    def update(self, prediction_error: torch.Tensor) -> None:
+        """Update per-dim running variance from the current prediction error.
+
+        Called once per segment after the bottom-up pass.  The gradient
+        graph is severed by @no_grad so this never enters the backward pass.
+
         Args:
-            x: [B, L, input_dim] — concatenation of z_lower and eps
+            prediction_error: [B, L, dim] — current ε = z_lower - μ_lower.
+        """
+        # Per-dim variance across batch (B) and sequence (L) dims
+        var = prediction_error.detach().pow(2).mean(dim=(0, 1))  # [dim]
+        self.ema_var.mul_(self.momentum).add_(var * (1.0 - self.momentum))
+
+    @property
+    def precision(self) -> torch.Tensor:
+        """Per-dim precision: 1 / (ema_var + eps).
 
         Returns:
-            pi: [B, L, output_dim] — precision vector, values > eps_min.
+            [dim] — never in the computation graph (buffer, no_grad update).
         """
-        return F.softplus(self.net(x)) + self.eps_min
+        return 1.0 / (self.ema_var + self.eps)
+
+    def per_head_precision(self, n_heads: int = 8) -> torch.Tensor:
+        """Per-attention-head precision by averaging over head dimensions.
+
+        Groups the dim features into n_heads equal chunks, averages the
+        EMA variance within each chunk, then returns per-head precision.
+        Useful for monitoring codebook health and crystallisation decisions.
+
+        Args:
+            n_heads: Number of attention heads (must divide dim evenly).
+
+        Returns:
+            [n_heads] precision values.
+        """
+        head_size = self.dim // n_heads
+        head_vars = self.ema_var.view(n_heads, head_size).mean(dim=1)  # [n_heads]
+        return 1.0 / (head_vars + self.eps)
 
 
 # ---------------------------------------------------------------------------
@@ -143,25 +176,35 @@ class PredictiveCodingModule(nn.Module):
     """Precision-weighted predictive coding for one adjacent level pair (l, l+1).
 
     Computes:
-        μ_l  = prediction_net(z_{l+1})           # top-down prediction
-        ε_l  = z_l - μ_l                          # prediction error
-        π_l  = precision_net(z_l)                 # precision vector
-        ξ_l  = π_l ⊙ ε_l                          # precision-weighted error
-        ξ_up = error_up_proj(ξ_l)                 # projected for level l+1
+        μ_l  = prediction_net(z_{l+1})             # top-down prediction
+        ε_l  = z_l - μ_l                            # prediction error
+        π_l  = running_precision.precision          # [dim] — EMA-based constant
+        ξ_l  = π_l ⊙ ε_l                            # precision-weighted error
+        ξ_up = error_up_proj(ξ_l)                   # projected for level l+1
+
+    v4.2: precision is computed from running EMA statistics, not a learned net.
+    running_precision.update(ε) is called inside forward() to track variance.
 
     Args:
         dim_lower: Dimension d_l of the lower (faster) level.
         dim_upper: Dimension d_{l+1} of the upper (slower) level.
-        eps_min: Minimum precision floor.
+        eps_min:   Minimum variance floor (prevents precision explosion).
+        momentum:  EMA momentum for running precision (default 0.99).
     """
 
-    def __init__(self, dim_lower: int, dim_upper: int, eps_min: float = 0.01) -> None:
+    def __init__(
+        self,
+        dim_lower: int,
+        dim_upper: int,
+        eps_min: float = 0.01,
+        momentum: float = 0.99,
+    ) -> None:
         super().__init__()
         self.dim_lower = dim_lower
         self.dim_upper = dim_upper
 
         self.prediction_net = PredictionNetwork(dim_upper, dim_lower)
-        self.precision_net = PrecisionNetwork(input_dim=dim_lower * 2, output_dim=dim_lower, eps_min=eps_min)
+        self.running_precision = RunningPrecision(dim_lower, momentum=momentum, eps=eps_min)
         self.error_up_proj = ErrorUpProjection(dim_lower, dim_upper)
 
     def predict(self, z_upper: torch.Tensor) -> torch.Tensor:
@@ -181,27 +224,25 @@ class PredictiveCodingModule(nn.Module):
         """Compute full predictive coding pass for one level pair.
 
         Args:
-            z_lower: [B, L, d_l]   — lower level state
+            z_lower: [B, L, d_l]     — lower level state
             z_upper: [B, L, d_{l+1}] — upper level state
 
         Returns:
             mu:    [B, L, d_l]       — top-down prediction
             eps:   [B, L, d_l]       — prediction error (z_lower - mu)
-            pi:    [B, L, d_l]       — precision vector (>0)
+            pi:    [d_l]             — precision vector (constant, not in grad graph)
             xi:    [B, L, d_l]       — precision-weighted error
-            xi_up: [B, L, d_{l+1}]   — projected error for upper level input
+            xi_up: [B, L, d_{l+1}]  — projected error for upper level input
         """
         mu = self.prediction_net(z_upper)
         eps = z_lower - mu
-        pi = self.precision_net(torch.cat([z_lower, eps], dim=-1))
 
-        # Runtime guard against precision explosion (catches wrong regulariser sign)
-        assert pi.mean().item() < 100, (
-            f"Precision explosion detected: pi.mean()={pi.mean().item():.2f}. "
-            "Check the precision regulariser sign in the loss function."
-        )
+        # Update running statistics (no_grad — precision is a constant multiplier).
+        # Called once per segment; the EMA tracks the per-dim error variance.
+        self.running_precision.update(eps)
+        pi = self.running_precision.precision  # [dim_lower], not in grad graph
 
-        xi = pi * eps
+        xi = pi * eps       # broadcasts [dim_lower] over [B, L, dim_lower]
         xi_up = self.error_up_proj(xi)
         return mu, eps, pi, xi, xi_up
 
@@ -216,35 +257,17 @@ def precision_weighted_prediction_loss(
 ) -> torch.Tensor:
     """Precision-weighted squared prediction error.
 
-    L_pred = ½ * Σ π_l ⊙ ε_l²
+    L_pred = mean(π.detach() ⊙ ε²)
 
-    Encourages accurate predictions; high-precision dimensions are penalised
+    π is treated as a constant (already detached via RunningPrecision).
+    Encourages accurate predictions; high-precision dimensions penalised
     more for errors.
 
     Args:
         eps: [B, L, d_l] — prediction error.
-        pi:  [B, L, d_l] — precision vector.
+        pi:  [d_l] or [B, L, d_l] — precision vector (constant, detached).
 
     Returns:
         Scalar loss.
     """
-    return 0.5 * (pi * eps.pow(2)).mean(dim=-1).mean()
-
-
-def precision_regulariser(pi: torch.Tensor) -> torch.Tensor:
-    """Symmetric log-normal precision regulariser.
-
-    L_π = ½ * (log π)²
-
-    Minimum at π=1. Penalises both under-precision (π→0) and over-precision
-    (π→∞) symmetrically in log space. This is the CORRECT regulariser.
-
-    Do NOT use -½ log π (naive), which causes unbounded precision growth.
-
-    Args:
-        pi: [B, L, d_l] — precision vector.
-
-    Returns:
-        Scalar loss.
-    """
-    return 0.5 * torch.log(pi).pow(2).mean(dim=-1).mean()
+    return (pi.detach() * eps.pow(2)).mean(dim=-1).mean()

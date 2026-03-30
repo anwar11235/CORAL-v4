@@ -176,11 +176,10 @@ def test_pc_chain_connected(small_config):
 
     total_loss.backward()
 
-    # Prediction and precision nets should always have gradients
-    for name in ("prediction_net", "precision_net"):
-        net = getattr(core.pc_modules[0], name)
-        for pname, param in net.named_parameters():
-            assert param.grad is not None, f"No gradient for pc_modules[0].{name}.{pname}"
+    # prediction_net has learnable parameters and must receive gradients.
+    # (v4.2: precision_net removed; RunningPrecision has zero learnable params)
+    for pname, param in core.pc_modules[0].prediction_net.named_parameters():
+        assert param.grad is not None, f"No gradient for pc_modules[0].prediction_net.{pname}"
 
     # error_up_proj gets gradient through halting loss -> z_states[1] -> xi_up
     # (halting network uses z_states[1], which was computed using xi_up as conditioning)

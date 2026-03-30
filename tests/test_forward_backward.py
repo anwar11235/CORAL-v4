@@ -87,19 +87,13 @@ def test_level2_gets_gradient_from_level1():
     )
     seg_loss.backward()
 
-    # PC module prediction network (level 0→1) must have gradients
+    # PC module prediction network (level 0→1) must have gradients.
+    # (v4.2: precision_net removed; RunningPrecision has zero learnable params)
     pred_net_grads = [
         p.grad for p in core.pc_modules[0].prediction_net.parameters()
         if p.grad is not None
     ]
     assert len(pred_net_grads) > 0, "PC module prediction network has no gradients"
-
-    # Precision network must have gradients
-    prec_net_grads = [
-        p.grad for p in core.pc_modules[0].precision_net.parameters()
-        if p.grad is not None
-    ]
-    assert len(prec_net_grads) > 0, "PC module precision network has no gradients"
 
 
 def test_no_nan_gradients():

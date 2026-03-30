@@ -124,6 +124,7 @@ class CoralCore(nn.Module):
                     dim_lower=config.level_dims[i],
                     dim_upper=config.level_dims[i + 1],
                     eps_min=config.epsilon_min,
+                    momentum=getattr(config, "precision_momentum", 0.99),
                 )
                 for i in range(config.n_levels - 1)
             ])

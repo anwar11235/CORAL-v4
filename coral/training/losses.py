@@ -1,17 +1,18 @@
-"""CORAL v4 — Unified loss function.
+"""CORAL v4.2 — Unified loss function.
 
 Loss components:
   L_task:   Stablemax cross-entropy (float64) — always active
   L_pred:   Precision-weighted prediction error — when use_predictive_coding
-  L_pi:     Precision regulariser (symmetric log-normal) — when use_predictive_coding
+            (v4.2: precision is a running-EMA constant, not a learned network)
   L_halt:   Q-learning halting loss — always active
   L_amort:  Amortisation pressure (sum of ||eps||²) — Experiment 2+
   L_crystal: Crystallisation loss — Experiment 3+
   L_commit: Commitment loss — Experiment 3+
 
-All components returned individually for W&B logging.
+v4.2 change: L_pi (precision regulariser) removed.  The learned PrecisionNetwork
+and its (log π)² regulariser are replaced by RunningPrecision with zero parameters.
 
-CRITICAL: L_pi uses (log π)² NOT -log π. The latter causes precision explosion.
+All components returned individually for W&B logging.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -21,10 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from coral.config import ModelConfig
-from coral.model.predictive_coding import (
-    precision_regulariser,
-    precision_weighted_prediction_loss,
-)
+from coral.model.predictive_coding import precision_weighted_prediction_loss
 
 IGNORE_LABEL_ID: int = -100
 
@@ -166,9 +164,11 @@ class CoralLoss(nn.Module):
         L_task = (per_token.sum(-1).float() / loss_counts).mean()
         breakdown["loss/task"] = L_task.float()
 
-        # ---- Predictive coding losses ----
+        # ---- Predictive coding loss ----
+        # v4.2: precision is a running-EMA constant (pi.detach() inside the loss fn).
+        # The precision regulariser (L_pi) has been removed — RunningPrecision has
+        # zero parameters and requires no regularisation.
         L_pred = torch.tensor(0.0, device=device)
-        L_pi = torch.tensor(0.0, device=device)
 
         if self.config.use_predictive_coding and pred_errors and precisions:
             for key in pred_errors:
@@ -176,13 +176,10 @@ class CoralLoss(nn.Module):
                     eps = pred_errors[key]
                     pi = precisions[key]
                     L_pred = L_pred + precision_weighted_prediction_loss(eps, pi)
-                    L_pi = L_pi + precision_regulariser(pi)
 
             L_pred = self.config.lambda_pred * L_pred
-            L_pi = self.config.lambda_pi * L_pi
 
         breakdown["loss/prediction"] = L_pred
-        breakdown["loss/precision_reg"] = L_pi
 
         # ---- Halting loss ----
         L_halt = torch.tensor(0.0, device=device)
@@ -220,7 +217,7 @@ class CoralLoss(nn.Module):
         breakdown["loss/commitment"] = L_commit
 
         # ---- Total ----
-        total = L_task.float() + L_pred + L_pi + L_halt + L_amort + L_crystal + L_commit
+        total = L_task.float() + L_pred + L_halt + L_amort + L_crystal + L_commit
         breakdown["loss/total"] = total
 
         return total, breakdown

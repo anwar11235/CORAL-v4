@@ -101,6 +101,42 @@ All 35 previously-passing tests continue to pass.
 **Test status:** 49/51 pass (2 pre-existing `PrecisionNetwork` failures unchanged).
 All 35 previously-passing tests continue to pass.
 
+### Session 3 — Running-Statistics Precision (2026-03-30)
+
+**What was done:**
+1. **`coral/model/predictive_coding.py`** — Replaced learned precision with `RunningPrecision`:
+   - `PrecisionNetwork` class **removed** entirely.
+   - `RunningPrecision(dim, momentum=0.99, eps=0.01)` added:
+     - `register_buffer('ema_var', ones(dim))` — zero learnable parameters.
+     - `@torch.no_grad() update(eps)` — EMA update of per-dim variance.
+     - `precision` property: `1/(ema_var + eps)` — not in grad graph.
+     - `per_head_precision(n_heads=8)` — mean-per-head [H] tensor.
+   - `PredictiveCodingModule` updated:
+     - `precision_net` replaced by `running_precision: RunningPrecision`.
+     - `forward()` calls `running_precision.update(eps)` then reads `precision` as constant.
+     - Returns `pi: [dim_lower]` (was `[B, L, dim_lower]`) — broadcasts in loss.
+     - `momentum` argument added (default 0.99).
+   - `precision_regulariser` function **removed**.
+   - `precision_weighted_prediction_loss` updated: now calls `pi.detach()` explicitly.
+
+2. **`coral/training/losses.py`** — Removed precision regulariser:
+   - Import of `precision_regulariser` removed.
+   - `L_pi` term removed from `CoralLoss.forward`; `breakdown["loss/precision_reg"]` removed.
+   - Total loss formula simplified.
+
+3. **`coral/model/coral_core.py`** — Passes `precision_momentum` from config to
+   `PredictiveCodingModule` (via `getattr(config, 'precision_momentum', 0.99)`).
+
+4. **`tests/test_predictive_coding.py`** — Fully rewritten for v4.2:
+   - Tests for `PrecisionNetwork` replaced by 6 `RunningPrecision` tests.
+   - Tests for `precision_regulariser` replaced by precision explosion / NaN tests.
+   - 2 previously-failing tests now pass.
+
+5. **`tests/test_coral_core.py`** + **`tests/test_forward_backward.py`** — Updated to
+   remove `precision_net` references (replaced with comments noting v4.2 removal).
+
+**Test status:** 56/56 pass — all previously-failing `PrecisionNetwork` tests now pass.
+
 Key v4.2 changes from v4.1:
 - Learned precision network → running-statistics precision (EMA, no parameters)
 - Learned recognition network → convergence-driven crystallisation (velocity monitoring, no parameters)
