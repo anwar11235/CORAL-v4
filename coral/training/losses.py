@@ -195,8 +195,10 @@ class CoralLoss(nn.Module):
             L_halt = F.binary_cross_entropy_with_logits(
                 q_halt_logits, halt_target, reduction="mean"
             )
-            if q_continue_logits is not None:
-                # Bootstrap: use q_halt as proxy target for continue
+            if q_continue_logits is not None and getattr(self.config, "use_continue_loss", False):
+                # Bootstrap: use q_halt as proxy target for continue.
+                # Disabled by default (use_continue_loss=False): TRM's authors found this
+                # adds noisy gradient signal early in training without improving convergence.
                 with torch.no_grad():
                     target_continue = torch.sigmoid(q_halt_logits.detach())
                 L_halt = L_halt + F.binary_cross_entropy_with_logits(

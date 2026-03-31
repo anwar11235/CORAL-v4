@@ -127,10 +127,18 @@ class TrainerV4:
         self.optimizer.step()
         self.step += 1
 
-        metrics: Dict[str, float] = {"loss/total": total_loss.item()}
+        metrics: Dict[str, float] = {}
         if all_breakdowns:
             for k, v in all_breakdowns[-1].items():
-                metrics[k] = v.item() if isinstance(v, torch.Tensor) else v
+                if k == "loss/total":
+                    # Rename to avoid overwriting the real training loss (sum across segments).
+                    metrics["loss/last_seg_total"] = v.item() if isinstance(v, torch.Tensor) else v
+                else:
+                    metrics[k] = v.item() if isinstance(v, torch.Tensor) else v
+        # loss/total = sum across ALL segments — this is what backward() received.
+        # loss/per_segment_avg = normalised per-segment loss for monitoring.
+        metrics["loss/total"] = total_loss.item()
+        metrics["loss/per_segment_avg"] = total_loss.item() / max(output.num_segments, 1)
         metrics["train/num_segments"] = output.num_segments
 
         return metrics

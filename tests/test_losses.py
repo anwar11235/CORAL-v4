@@ -246,6 +246,76 @@ def test_end_to_end_baseline_loss_no_nan():
     assert total_loss.item() >= 0.0, "Baseline end-to-end loss must be >= 0"
 
 
+# ---------------------------------------------------------------------------
+# Q-continue loss gating (Bug 3 fix, Session 9)
+# ---------------------------------------------------------------------------
+
+def test_continue_loss_disabled_by_default():
+    """With use_continue_loss=False (default), halt loss = 0.5 * BCE(q_halt) only."""
+    config = _baseline_config()  # use_continue_loss defaults to False
+    assert not getattr(config, "use_continue_loss", False), "Expected False by default"
+    loss_fn = CoralLoss(config)
+
+    B, L, vocab = 2, 9, 10
+    logits = torch.randn(B, L, vocab)
+    labels = torch.randint(1, vocab, (B, L))
+    q_halt = torch.randn(B)
+    q_cont = torch.randn(B)  # provided but must be ignored when flag is False
+
+    _, breakdown = loss_fn(
+        logits=logits, labels=labels,
+        q_halt_logits=q_halt, q_continue_logits=q_cont,
+    )
+
+    # Manually compute expected halt loss (halt term only, no continue)
+    import torch.nn.functional as F_local
+    mask = labels != -100
+    preds = logits.argmax(dim=-1)
+    seq_correct = ((preds == labels) & mask).sum(-1) == mask.sum(-1)
+    halt_target = seq_correct.float()
+    expected = 0.5 * F_local.binary_cross_entropy_with_logits(
+        q_halt, halt_target, reduction="mean"
+    )
+
+    assert breakdown["loss/halting"].item() == pytest.approx(expected.item(), abs=1e-5), (
+        "use_continue_loss=False: halt loss must equal 0.5 * BCE(q_halt, target) with "
+        "no continue-loss contribution"
+    )
+
+
+def test_continue_loss_adds_to_halt_when_enabled():
+    """With use_continue_loss=True, halt loss differs from the halt-only value."""
+    from coral.config import ModelConfig as _MC
+    config_on = _MC(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=2, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=10, mode="baseline",
+        use_continue_loss=True,
+    )
+    config_off = _baseline_config()  # use_continue_loss=False
+    fn_on = CoralLoss(config_on)
+    fn_off = CoralLoss(config_off)
+
+    B, L, vocab = 2, 9, 10
+    logits = torch.randn(B, L, vocab)
+    labels = torch.randint(1, vocab, (B, L))
+    q_halt = torch.randn(B)
+    # Use extreme q_cont so the continue-BCE is clearly non-zero
+    q_cont = torch.full((B,), 5.0)
+
+    _, bd_off = fn_off(logits=logits, labels=labels, q_halt_logits=q_halt, q_continue_logits=q_cont)
+    _, bd_on = fn_on(logits=logits, labels=labels, q_halt_logits=q_halt, q_continue_logits=q_cont)
+
+    halt_off = bd_off["loss/halting"].item()
+    halt_on = bd_on["loss/halting"].item()
+    assert halt_on != pytest.approx(halt_off, abs=1e-5), (
+        "use_continue_loss=True must produce a different halt loss than use_continue_loss=False "
+        "when q_continue_logits are non-trivial"
+    )
+
+
 def test_end_to_end_full_mode_loss_no_nan():
     """Full forward + loss in full mode must produce finite, non-NaN loss."""
     config = _full_mode_config()

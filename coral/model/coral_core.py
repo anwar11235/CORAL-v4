@@ -10,7 +10,7 @@ Inner loop structure for N=2, T=3:
 
         # Level 1: T^1 = 3 inner steps (fast)
         for t in 0..2:
-            h = backbone(W_up[1](z_1) + level_emb[1] + ts_emb[t] + mu_1_projected)
+            h = backbone(W_up[1](z_1) + level_emb[1] + ts_emb[t] + z1_input_injection + mu_1_projected)
             z_1 = W_down[1](h)
 
         # Precision-weighted error
@@ -172,6 +172,7 @@ class CoralCore(nn.Module):
         n_steps: int,
         conditioning: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
+        input_injection: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run backbone recursion for one level.
 
@@ -179,7 +180,7 @@ class CoralCore(nn.Module):
         After each backbone step, the conditioning signal is applied as a
         residual correction in d_l space:
 
-            z_new  = project_down(backbone(project_up(z) + level_emb + ts_emb))
+            z_new  = project_down(backbone(project_up(z) + level_emb + ts_emb + input_injection))
             z      = z_new + gate * (conditioning - z)   # if conditioning given
 
         The residual (conditioning - z) represents what the conditioning signal
@@ -196,6 +197,12 @@ class CoralCore(nn.Module):
                             (top-down prediction or error from below)
             attention_bias: Optional [L, L] float tensor added to attention
                             logits in every backbone step (v4.2 local bias).
+            input_injection: Optional [B, L, backbone_dim] tensor added to
+                            the backbone input at every inner step. Used to
+                            re-inject the original encoder output so the
+                            backbone always has access to the task constraints
+                            (e.g. given digits in Sudoku) regardless of how
+                            many segments have elapsed.
 
         Returns:
             Updated z: [B, L, d_l]
@@ -208,6 +215,11 @@ class CoralCore(nn.Module):
             backbone_in = level_mod.project_up(z)
             backbone_in = backbone_in + self.level_emb(level_idx, device).unsqueeze(0).unsqueeze(0)
             backbone_in = backbone_in + self.timescale_emb(t).unsqueeze(0).unsqueeze(0)
+
+            # Re-inject the original task input (given digits in Sudoku) so the
+            # backbone always has access to the constraint signal at every step.
+            if input_injection is not None:
+                backbone_in = backbone_in + input_injection
 
             # Run backbone — no conditioning in the backbone input
             z_new = level_mod.project_down(
@@ -286,6 +298,19 @@ class CoralCore(nn.Module):
         if use_crys:
             self.crystallisation_manager.monitor.reset(B, L, device)
 
+        # Input re-injection signal: the original encoder output is added to the backbone
+        # input at EVERY inner step in EVERY segment (matching TRM's approach).  This ensures
+        # the backbone always has direct access to the task constraints (given digits in Sudoku)
+        # rather than relying solely on the recurrent state to remember them.
+        #
+        # z1_init is [B, L, backbone_dim=512].  Since backbone_in is also at backbone_dim after
+        # project_up, the shapes always match regardless of level depth.
+        #
+        # CRITICAL: z1_init is NOT detached between segments — gradients flow back to the
+        # encoder (adapter) through every injection point, giving the embedding layers a
+        # learning signal from all K_max segments, not just the first.
+        input_signal: Optional[torch.Tensor] = z1_init
+
         output = CoralOutput()
 
         for seg in range(K_max):
@@ -300,7 +325,8 @@ class CoralCore(nn.Module):
                 # This is the clean no-PC path used for Phase 1 experiments.
                 # ------------------------------------------------------------
                 z_states[0] = self._run_level(
-                    z_states[0], 0, self.T, conditioning=None, attention_bias=attn_bias
+                    z_states[0], 0, self.T, conditioning=None, attention_bias=attn_bias,
+                    input_injection=input_signal,
                 )
 
             else:
@@ -347,7 +373,8 @@ class CoralCore(nn.Module):
                     # Run backbone recursion for this level
                     n_steps = self.level_steps[i]
                     z_states[i] = self._run_level(
-                        z_states[i], i, n_steps, conditioning=cond, attention_bias=attn_bias
+                        z_states[i], i, n_steps, conditioning=cond, attention_bias=attn_bias,
+                        input_injection=input_signal,
                     )
 
                     # Compute precision-weighted error and project upward

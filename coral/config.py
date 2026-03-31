@@ -35,6 +35,7 @@ class ModelConfig:
     halting_threshold: float = 0.95
     halting_exploration_prob: float = 0.1
     halting_gamma: float = 0.9  # Q-learning discount factor
+    use_continue_loss: bool = False  # Enable Q-continue bootstrapping loss (TRM disabled this; off by default)
 
     # Components disabled for Experiment 1
     use_crystallisation: bool = False
