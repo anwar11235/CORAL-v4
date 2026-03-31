@@ -180,6 +180,43 @@ All 35 previously-passing tests continue to pass.
 **Test status:** 74/74 pass. `CrystallisationManager` is NOT yet integrated into `CoralCore`
 (that is Session 5). The module is fully tested in isolation.
 
+### Session 5 — Integrate Crystallisation into Core (2026-03-30)
+
+**What was done:**
+1. **`coral/model/coral_core.py`** — Wired `CrystallisationManager` into mode="full":
+   - Import added; `crystallisation_manager` created in `__init__` when `config.use_crystallisation`.
+   - `CoralOutput` extended with `crystal_stats`, `commit_losses`, `dis_losses` fields.
+   - `use_crys` flag computed at start of forward (effective_mode=="full" AND manager exists).
+   - `monitor.reset(B, L, device)` called once per forward pass before the segment loop.
+   - Segment loop: START of segment: `crystal_manager.step()` snaps newly converged heads.
+     END of segment: `monitor.check_decrystallisation()` unfreezes drifted heads.
+     `get_losses()` collects commit/dis per segment.
+   - Decode: training → `decode_fn(z_states[0])` (raw backbone, full gradients);
+     eval → `enforce_after_backbone(z_states[0])` then decode (crystallised → codebook value).
+   - NotImplementedError for mode="full" **removed**.
+
+2. **`coral/training/losses.py`** — Added `commitment_loss` and `disentanglement_loss` args:
+   - Both optional; ignored when `config.use_crystallisation=False`.
+   - `L_commit = lambda_commit * commitment_loss`, `L_crystal = lambda_dis * disentanglement_loss`.
+   - Both added to total loss and returned in breakdown dict.
+
+3. **`coral/training/trainer.py`** — Crystallisation losses + eval diagnostics:
+   - `train_step`: passes `commit_losses[i]` and `dis_losses[i]` to `loss_fn` per segment.
+   - `eval_step`: logs `crystal/rate_total`, `crystal/rate_head_*`, `codebook/perplexity_head_*`,
+     and `crystal/bypass_accuracy` when `use_crystallisation=True`.
+
+4. **`tests/test_full_mode.py`** — 8 new tests (all pass):
+   - Forward pass completes in mode="full"; output shapes unchanged vs mode="pc_only"
+   - `crystal_stats` populated when use_crystallisation=True; empty when False
+   - Backward: backbone params have non-zero gradients despite crystallisation enforce
+   - Commit/dis losses in breakdown; no NaN/Inf gradients; manager gated by config
+
+**Test status:** 82/82 pass.
+
+**CRITICAL gradient invariant (Session 5):** In training, logits are decoded from raw
+backbone output BEFORE enforce. `crystal_manager.step()` at the START of the NEXT segment
+enforces on the already-detached state, so backbone gradients are never cut during loss computation.
+
 Key v4.2 changes from v4.1:
 - Learned precision network → running-statistics precision (EMA, no parameters)
 - Learned recognition network → convergence-driven crystallisation (velocity monitoring, no parameters)
@@ -376,9 +413,11 @@ python scripts/codebook_analysis.py \
 
 ## Key Reference Documents
 
+
 | Document | Purpose |
 |----------|---------|
 | `CORAL_Architecture_Spec_v4.2.md` | Authoritative architecture reference — what to build |
 | `CORAL_v4.2_Build_Plan.md` | Build sequence — how to build it (8 sessions) |
 | `CORAL_v4_Handoff_Note.md` | Historical context — what was tried, what failed, current state |
 | `CORAL_v4_Research_Plan_Crystallisation_First.md` | Research phases — what experiments to run |
+`documents at 'CORAL-v4\docs\`

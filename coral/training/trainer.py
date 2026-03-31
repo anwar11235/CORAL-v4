@@ -112,6 +112,8 @@ class TrainerV4:
                     q_halt_logits=output.q_halt_logits[i] if output.q_halt_logits else None,
                     q_continue_logits=output.q_continue_logits[i] if output.q_continue_logits else None,
                     all_pred_errors=output.pred_errors if i == len(output.all_logits) - 1 else None,
+                    commitment_loss=output.commit_losses[i] if output.commit_losses else None,
+                    disentanglement_loss=output.dis_losses[i] if output.dis_losses else None,
                 )
                 total_loss = total_loss + seg_loss
                 all_breakdowns.append(breakdown)
@@ -173,11 +175,48 @@ class TrainerV4:
         exact_acc = exact_correct.float().mean().item()
         token_acc = (correct_tokens.sum().float() / mask.sum().float()).item() if mask.sum() > 0 else 0.0
 
-        return {
+        metrics: dict = {
             "eval/exact_accuracy": exact_acc,
             "eval/token_accuracy": token_acc,
             "eval/avg_halting_step": float(output.num_segments),
         }
+
+        # ---- Crystallisation diagnostics (mode="full" only) ----
+        use_crys = (
+            self.config.model.use_crystallisation
+            and hasattr(self.core, "crystallisation_manager")
+            and self.core.crystallisation_manager is not None
+        )
+        if use_crys and output.crystal_stats:
+            crys_mgr = self.core.crystallisation_manager
+            crys_stats_overall = crys_mgr.get_stats()
+
+            # Aggregate crystallisation rate from the last segment's stats
+            last_stats = output.crystal_stats[-1]
+            if "crystallisation_rate" in last_stats:
+                metrics["crystal/rate_total"] = last_stats["crystallisation_rate"].item()
+            if "per_head_rates" in last_stats:
+                per_head = last_stats["per_head_rates"]
+                for h, rate in enumerate(per_head):
+                    metrics[f"crystal/rate_head_{h}"] = rate.item()
+
+            # Codebook health
+            perplexity = crys_stats_overall.get("perplexity")
+            if perplexity is not None:
+                for h, p in enumerate(perplexity):
+                    metrics[f"codebook/perplexity_head_{h}"] = p.item()
+
+            # Bypass accuracy: decode from crystallised (enforced) state
+            z_full = output.z_states[0]
+            z_crystal = crys_mgr.enforce_after_backbone(z_full)
+            with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+                logits_crystal = self.adapter.decode(z_crystal)
+            preds_crystal = logits_crystal.argmax(dim=-1)
+            bypass_correct = (preds_crystal == labels) & mask
+            bypass_exact = (bypass_correct.sum(-1) == mask.sum(-1))
+            metrics["crystal/bypass_accuracy"] = bypass_exact.float().mean().item()
+
+        return metrics
 
     def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None) -> None:
         """Log metrics to W&B and console."""

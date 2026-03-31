@@ -136,6 +136,8 @@ class CoralLoss(nn.Module):
         q_halt_logits: Optional[torch.Tensor] = None,
         q_continue_logits: Optional[torch.Tensor] = None,
         all_pred_errors: Optional[List[Dict[str, torch.Tensor]]] = None,
+        commitment_loss: Optional[torch.Tensor] = None,
+        disentanglement_loss: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute total loss and breakdown.
 
@@ -211,10 +213,17 @@ class CoralLoss(nn.Module):
         breakdown["loss/amortisation"] = L_amort
 
         # ---- Crystallisation losses (Experiment 3+) ----
-        L_crystal = torch.tensor(0.0, device=device)
+        # commitment_loss  = ||z_h - sg(e_h)||²  (backbone commits to codebook entries)
+        # disentanglement_loss = Σ ||C_h1^T @ C_h2||_F² / M² (heads stay orthogonal)
         L_commit = torch.tensor(0.0, device=device)
-        breakdown["loss/crystallisation"] = L_crystal
+        L_crystal = torch.tensor(0.0, device=device)
+        if self.config.use_crystallisation:
+            if commitment_loss is not None:
+                L_commit = self.config.lambda_commit * commitment_loss.to(device)
+            if disentanglement_loss is not None:
+                L_crystal = self.config.lambda_dis * disentanglement_loss.to(device)
         breakdown["loss/commitment"] = L_commit
+        breakdown["loss/crystallisation"] = L_crystal
 
         # ---- Total ----
         total = L_task.float() + L_pred + L_halt + L_amort + L_crystal + L_commit

@@ -38,6 +38,7 @@ import torch.nn as nn
 
 from coral.config import CoralConfig, ModelConfig
 from coral.model.backbone import CoralBackbone, LevelEmbedding, TimescaleEmbedding
+from coral.model.crystallisation import CrystallisationManager
 from coral.model.halting import HaltingNetwork, should_halt
 from coral.model.level_module import LevelStack
 from coral.model.predictive_coding import PredictiveCodingModule
@@ -70,6 +71,10 @@ class CoralOutput:
     pred_errors: List[Dict[str, torch.Tensor]] = field(default_factory=list)
     precisions: List[Dict[str, torch.Tensor]] = field(default_factory=list)
     num_segments: int = 0
+    # Crystallisation outputs (empty when use_crystallisation=False)
+    crystal_stats: List[Dict] = field(default_factory=list)
+    commit_losses: List[torch.Tensor] = field(default_factory=list)
+    dis_losses: List[torch.Tensor] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +143,12 @@ class CoralCore(nn.Module):
 
         # Halting network
         self.halting = HaltingNetwork(config)
+
+        # Crystallisation manager (mode="full" + use_crystallisation=True only)
+        if config.use_crystallisation:
+            self.crystallisation_manager = CrystallisationManager(config)
+        else:
+            self.crystallisation_manager = None
 
         # Learnable scalar gate per level that controls conditioning strength.
         # Initialised to 1.0 (no-op) so training starts with the full signal.
@@ -265,17 +276,22 @@ class CoralCore(nn.Module):
             z_init = self.z_init_proj[i - 1](z_states[i - 1])
             z_states.append(z_init)
 
-        output = CoralOutput()
+        # Whether crystallisation is active this forward pass
+        use_crys = (
+            self.effective_mode == "full"
+            and self.crystallisation_manager is not None
+        )
 
-        if self.effective_mode == "full":
-            raise NotImplementedError(
-                "mode='full' (PC + crystallisation) is not yet implemented. "
-                "It will be wired in Session 5."
-            )
+        # Reset the convergence monitor for this batch (state is per-batch, not per-model)
+        if use_crys:
+            self.crystallisation_manager.monitor.reset(B, L, device)
+
+        output = CoralOutput()
 
         for seg in range(K_max):
             seg_eps: Dict[str, torch.Tensor] = {}
             seg_pi: Dict[str, torch.Tensor] = {}
+            seg_crystal_stats: Dict = {}
 
             if self.effective_mode == "baseline":
                 # ------------------------------------------------------------
@@ -288,7 +304,7 @@ class CoralCore(nn.Module):
                 )
 
             else:
-                # effective_mode == "pc_only" (or legacy use_predictive_coding=True)
+                # effective_mode == "pc_only" or "full"
                 # ----------------------------------------------------------------
                 # Top-down pass: compute predictions for each level
                 # ----------------------------------------------------------------
@@ -296,6 +312,19 @@ class CoralCore(nn.Module):
                 if self.config.use_predictive_coding:
                     for i in range(self.n_levels - 2, -1, -1):  # from N-2 down to 0
                         predictions[i] = self.pc_modules[i].predict(z_states[i + 1])
+
+                # ----------------------------------------------------------------
+                # Crystallisation step (mode="full" only): detect convergence at
+                # the START of each segment and snap newly converged heads to their
+                # nearest codebook entry.  Runs BEFORE the backbone so crystallised
+                # positions are already pinned when the inner loop begins.
+                # ----------------------------------------------------------------
+                if use_crys:
+                    z_states[0], _crys_mask, seg_crystal_stats = (
+                        self.crystallisation_manager.step(
+                            z_states[0], z_prev=None, segment_idx=seg
+                        )
+                    )
 
                 # ----------------------------------------------------------------
                 # Bottom-up pass: recurrence + error propagation
@@ -332,11 +361,42 @@ class CoralCore(nn.Module):
                         # xi_up goes into level i+1's input next segment
                         error_signals[i + 1] = xi_up
 
+                # ----------------------------------------------------------------
+                # De-crystallisation check (mode="full"): if the backbone proposes
+                # a value that drifts far from the frozen entry, unfreeze that head.
+                # Must run AFTER the backbone, BEFORE the next crystallisation step.
+                # ----------------------------------------------------------------
+                if use_crys:
+                    self.crystallisation_manager.monitor.check_decrystallisation(z_states[0])
+
+            # ----------------------------------------------------------------
+            # Crystallisation losses (accumulated once per segment).
+            # Collected after the backbone + decrystal check so they reflect
+            # the final state for this segment.
+            # ----------------------------------------------------------------
+            if use_crys:
+                commit, dis = self.crystallisation_manager.get_losses()
+                output.commit_losses.append(commit)
+                output.dis_losses.append(dis)
+            output.crystal_stats.append(seg_crystal_stats)
+
             # ----------------------------------------------------------------
             # Decode to logits for deep supervision (if decode_fn provided).
+            #
+            # TRAINING: decode from the raw backbone output (z_states[0]).
+            #   Crystallised heads are already pinned at the start of the segment
+            #   via crystal_manager.step(), so the backbone only updates active heads.
+            #   Decoding the raw backbone output ensures gradients flow unobstructed.
+            #
+            # EVAL: enforce crystallised heads onto the backbone output before
+            #   decoding, so crystallised positions always output their codebook value.
             # ----------------------------------------------------------------
             if decode_fn is not None:
-                logits = decode_fn(z_states[0])
+                if training or not use_crys:
+                    logits = decode_fn(z_states[0])
+                else:
+                    z_eval = self.crystallisation_manager.enforce_after_backbone(z_states[0])
+                    logits = decode_fn(z_eval)
                 output.all_logits.append(logits)
 
             # ----------------------------------------------------------------
