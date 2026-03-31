@@ -137,6 +137,49 @@ All 35 previously-passing tests continue to pass.
 
 **Test status:** 56/56 pass — all previously-failing `PrecisionNetwork` tests now pass.
 
+### Session 4 — Multi-Headed Semantic Codebooks + Crystallisation (2026-03-30)
+
+**What was done:**
+1. **`coral/model/crystallisation.py`** — New file implementing three components:
+   - `MultiHeadedCodebook(dim, n_heads, entries_per_head, ema_decay)`:
+     - Codebook stored as `register_buffer` — zero learnable parameters, EMA updates only.
+     - Shape `[H, M, d_head]` where `d_head = dim / H`.
+     - `quantise(z, hard=True)` — hard nearest-neighbour with straight-through gradient.
+     - `update_ema(z, indices)` — scatter_add EMA update (no grad).
+     - `dead_code_restart(z_buffer, threshold)` — replaces stale entries from rolling buffer.
+     - `commitment_loss(z, z_q)` — `||z_h - sg(e_h)||²` per head, averaged.
+     - `disentanglement_loss()` — `Σ ||C_h1^T @ C_h2||²_F / M²` over h1<h2 pairs, ×2.
+     - `initialise_from_kmeans(states, n_iter)` — offline k-means per head.
+     - `get_perplexity()` — `[H]` effective codebook usage (exp of entropy).
+   - `ConvergenceMonitor` (plain Python, no nn.Module):
+     - Tracks `z_prev`, `consecutive_converged [B,L,H]`, `crystallised [B,L,H]`, `frozen_values [B,L,H,d_head]`.
+     - `update_and_crystallise(z, codebook)` — computes per-head L2 velocity; triggers after `n_stable` steps.
+     - `check_decrystallisation(z_proposed)` — unfreezes heads where drift > `tau_decrystallise`.
+     - `enforce(z)` — overwrites crystallised heads with frozen codebook values.
+   - `CrystallisationManager(config)` (nn.Module, not yet wired into CoralCore):
+     - Owns one `MultiHeadedCodebook` and one `ConvergenceMonitor`.
+     - `step(z, z_prev, segment_idx)` → `(z_crystallised, mask, stats)`.
+     - `enforce_after_backbone(z)` — enforce without updating velocity counters.
+     - `get_losses()` → `(commitment_loss, disentanglement_loss)`.
+     - `get_stats()` → monitoring metrics for W&B.
+
+2. **`tests/test_crystallisation.py`** — 18 tests (all pass):
+   - Codebook is a buffer, not a parameter; zero learnable parameters; buffer shape [8,32,64]
+   - quantise: output shapes; output differs from input; straight-through gradient
+   - EMA update moves codebook entries
+   - Dead-code restart replaces unused entries
+   - commitment_loss = 0 when z equals codebook entries
+   - disentanglement_loss = 0 for orthogonal heads (standard basis construction)
+   - disentanglement_loss > 0 for correlated heads
+   - ConvergenceMonitor crystallises after n_stable steps; does not crystallise on high velocity
+   - De-crystallisation fires on large drift
+   - enforce() restores crystallised heads while preserving active heads
+   - Partial crystallisation (some heads crystallised, others not)
+   - CrystallisationManager end-to-end; get_losses() returns scalars
+
+**Test status:** 74/74 pass. `CrystallisationManager` is NOT yet integrated into `CoralCore`
+(that is Session 5). The module is fully tested in isolation.
+
 Key v4.2 changes from v4.1:
 - Learned precision network → running-statistics precision (EMA, no parameters)
 - Learned recognition network → convergence-driven crystallisation (velocity monitoring, no parameters)
