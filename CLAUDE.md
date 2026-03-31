@@ -341,6 +341,29 @@ Key v4.2 changes from v4.1:
 - Column heads / precision-driven sparsity → dropped entirely
 - Research sequence reordered: crystallisation-first, not predictive-coding-first
 
+### Session 9 — Bug Fixes + PC Diagnostic (2026-03-31)
+
+**What was done:**
+1. Fixed 3 training bugs (see project memory for details):
+   - Bug 1: No input re-injection (critical — backbone lost given-digit constraints after segment 0)
+   - Bug 2: `loss/total` overwritten by last-segment loss (masked real training signal)
+   - Bug 3: Q-continue bootstrapping loss always active (adds noisy gradients early in training)
+2. Added 22 tests covering all three fixes (155/155 pass)
+3. Created `scripts/diagnostic_pc_analysis.py` — trains 500 steps with PC enabled, collects
+   5 metrics at configurable steps to measure conditioning gate effect on representations
+
+**PC diagnostic findings (run on Vast.ai):**
+- `cond_gate` init=1.0 caused conditioning vector (1.5× larger than backbone output) to overwhelm backbone
+- `blur_ratio=0.43` — conditioning was pulling all positions toward a common mean
+- Result: PC token accuracy stalled at 15–18% vs 56% without PC
+- Fix: initialise `cond_gate` to 0.01 (1% nudge); gate is learnable and grows if useful
+
+**Files changed:**
+- `coral/model/coral_core.py` — `cond_gate` init changed from `torch.ones(1)` to `torch.full((1,), 0.01)`
+- `CLAUDE.md` — documented the `cond_gate` init decision and PC diagnostic findings
+
+**Test status:** 155/155 pass (no new tests needed — gate init is a 1-line hyperparameter change).
+
 ---
 
 ## Repository Layout
@@ -425,6 +448,10 @@ without explicit instruction.
 - **AdamW optimizer** (lr=7e-5, weight_decay=1.0, betas=(0.9, 0.95), cosine schedule)
 - **Post-backbone residual conditioning**: `z_new = backbone(z); z = z_new + gate * (conditioning - z)`
   Predictions/errors are residual corrections applied AFTER the backbone, not added to backbone input.
+  **`cond_gate` initialises to 0.01** (not 1.0). Diagnostic showed gate=1.0 caused conditioning
+  vector (1.5× larger than backbone output, blur_ratio=0.43) to overwhelm the backbone, collapsing
+  per-position representations toward a common mean and stalling token accuracy at 15–18%.
+  Gate is learnable — it grows if the prediction proves useful.
 - **Precision is NOT learned** — it is a running EMA statistic with zero learnable parameters
 - **Crystallisation is NOT gated by a learned network** — it is triggered by convergence velocity
 - **Codebooks are buffers, not parameters** — they update via EMA, not gradient descent

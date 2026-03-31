@@ -151,10 +151,10 @@ class CoralCore(nn.Module):
             self.crystallisation_manager = None
 
         # Learnable scalar gate per level that controls conditioning strength.
-        # Initialised to 1.0 (no-op) so training starts with the full signal.
-        # The model can learn to amplify or attenuate conditioning per level.
+        # Initialised to 0.01 so conditioning starts as a 1% nudge.
+        # The model can increase the gate if the prediction proves useful.
         self.cond_gate = nn.ParameterList([
-            nn.Parameter(torch.ones(1)) for _ in range(config.n_levels)
+            nn.Parameter(torch.full((1,), 0.01)) for _ in range(config.n_levels)
         ])
 
         # Linear projection to initialise higher-level states from the level
