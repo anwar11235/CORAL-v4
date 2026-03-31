@@ -217,6 +217,42 @@ All 35 previously-passing tests continue to pass.
 backbone output BEFORE enforce. `crystal_manager.step()` at the START of the NEXT segment
 enforces on the already-detached state, so backbone gradients are never cut during loss computation.
 
+### Session 6 — Representation Diagnostics + State Collection (2026-03-30)
+
+**What was done:**
+1. **`coral/training/trainer.py`** — Added `compute_repr_diagnostics(eval_loader, ...)`:
+   - Temporarily sets `halting_threshold=2.0` to disable early halting during collection.
+   - Collects `z_states[0]` (final segment) across eval batches.
+   - Filters to empty cells (token=0) for all metrics.
+   - Computes and returns a dict with keys:
+     - `repr/inter_position_similarity` — mean pairwise cosine sim (random 500-state sample)
+     - `repr/same_digit_similarity` — within-digit cosine sim averaged over digits 1–9
+     - `repr/effective_rank` — SVD-based component count explaining 90% variance
+     - `repr/state_norm_mean` / `repr/state_norm_std` — L2 norm statistics
+
+2. **`scripts/collect_states.py`** — Phase 2 state collection:
+   - CLI: `--checkpoint`, `--data-dir`, `--output`, `--segments` (e.g. "4,8,12,16"), `--device`
+   - Loads checkpoint with structured format (`config`, `adapter_state`, `core_state`).
+   - Runs one forward pass per target segment (K_max=s, halting disabled) over full eval set.
+   - Saves `.npz` with `states [N,81,len(segs),d]`, `labels [N,81]`, `given_mask [N,81]`.
+
+3. **`scripts/codebook_analysis.py`** — Phase 2 representation analysis:
+   - CLI: `--states`, `--output-dir`, `--segment-idx`, `--n-heads`, `--tsne-sample`
+   - Per-head k-means (k∈{16,32,64,128}): inertia, cluster purity, perplexity per head
+   - Whole-vector k-means (k∈{64,128,256,512}): same metrics + bypass accuracy
+   - Bypass accuracy = fraction of states whose cluster's majority-vote digit matches true digit
+   - t-SNE scatter plot (5000-state sample) coloured by digit, saved as PNG
+   - Bypass accuracy vs k curve, saved as PNG
+   - Requires `scikit-learn` and `matplotlib`
+
+4. **`tests/test_diagnostics.py`** — 7 tests (all pass):
+   - `compute_repr_diagnostics` returns non-NaN, finite values; correct keys; empty dict for empty loader
+   - collect_states logic produces .npz with correct shapes
+   - `per_head_analysis` and `whole_vector_analysis` return values in valid ranges
+   - End-to-end codebook analysis on synthetic .npz
+
+**Test status:** 89/89 pass.
+
 Key v4.2 changes from v4.1:
 - Learned precision network → running-statistics precision (EMA, no parameters)
 - Learned recognition network → convergence-driven crystallisation (velocity monitoring, no parameters)

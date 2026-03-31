@@ -20,7 +20,7 @@ train/eval loop, optimiser, and loss aggregation.
 """
 
 import logging
-from typing import Dict, Optional
+from typing import Dict, Iterable, List, Optional
 
 import torch
 import torch.nn as nn
@@ -215,6 +215,139 @@ class TrainerV4:
             bypass_correct = (preds_crystal == labels) & mask
             bypass_exact = (bypass_correct.sum(-1) == mask.sum(-1))
             metrics["crystal/bypass_accuracy"] = bypass_exact.float().mean().item()
+
+        return metrics
+
+    @torch.no_grad()
+    def compute_repr_diagnostics(
+        self,
+        eval_loader: Iterable,
+        max_puzzles: int = 500,
+        pca_sample: int = 5000,
+    ) -> Dict[str, float]:
+        """Compute representation diagnostics on a sample of eval puzzles.
+
+        Runs the model at full K_max and analyses the final-segment states.
+        Metrics:
+          repr/inter_position_similarity — mean pairwise cosine sim among empty-cell states
+          repr/same_digit_similarity     — mean within-digit cosine sim, averaged over digits
+          repr/effective_rank            — PCA components explaining 90% of variance
+          repr/state_norm_mean           — mean L2 norm of empty-cell states
+          repr/state_norm_std            — std of L2 norms
+
+        Args:
+            eval_loader: Iterable yielding batches with "inputs" and "labels".
+            max_puzzles: Maximum number of puzzles to process (for speed).
+            pca_sample:  Number of states sampled for the SVD/PCA estimate.
+
+        Returns:
+            Dict of repr/* metrics (empty if not enough data).
+        """
+        self.adapter.eval()
+        self.core.eval()
+
+        all_states: List[torch.Tensor] = []
+        all_labels: List[torch.Tensor] = []
+        all_empty: List[torch.Tensor] = []
+        n_collected = 0
+
+        # Temporarily disable halting so we always run full K_max segments
+        orig_threshold = self.core.config.halting_threshold
+        self.core.config.halting_threshold = 2.0  # sigmoid ∈ (0,1) → never triggers
+
+        try:
+            for batch in eval_loader:
+                if n_collected >= max_puzzles:
+                    break
+                inputs = batch["inputs"].to(self.device)
+                labels = batch["labels"].to(self.device)
+
+                with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+                    z1 = self.adapter.encode(inputs)
+                    output = self.core(
+                        z1,
+                        K_max=self.core.config.K_max,
+                        training=False,
+                        decode_fn=None,
+                    )
+
+                # z_states[0] = level-0 state after the final segment
+                z_final = output.z_states[0].float().cpu()   # [B, L, d]
+                empty_mask = (inputs == 0).cpu()             # [B, L]
+                labels_cpu = labels.cpu()                    # [B, L]
+
+                all_states.append(z_final)
+                all_labels.append(labels_cpu)
+                all_empty.append(empty_mask)
+                n_collected += inputs.shape[0]
+        finally:
+            self.core.config.halting_threshold = orig_threshold
+
+        if not all_states:
+            return {}
+
+        states = torch.cat(all_states, dim=0)   # [N, L, d]
+        labels_t = torch.cat(all_labels, dim=0)  # [N, L]
+        empty_t = torch.cat(all_empty, dim=0)    # [N, L]
+
+        N, L, d = states.shape
+        states_flat = states.reshape(N * L, d)
+        labels_flat = labels_t.reshape(N * L)
+        empty_flat = empty_t.reshape(N * L)
+
+        empty_states = states_flat[empty_flat]   # [E, d]
+        empty_labels = labels_flat[empty_flat]   # [E]
+
+        metrics: Dict[str, float] = {}
+        E = empty_states.shape[0]
+        if E < 2:
+            return metrics
+
+        # L2-normalise for cosine similarity
+        norms = empty_states.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        normed = empty_states / norms
+
+        # a) Inter-position similarity (random sample to limit O(S²) cost)
+        S = min(500, E)
+        idx = torch.randperm(E)[:S]
+        sample = normed[idx]                             # [S, d]
+        sim = sample @ sample.T                         # [S, S]
+        off_diag = ~torch.eye(S, dtype=torch.bool)
+        metrics["repr/inter_position_similarity"] = sim[off_diag].mean().item()
+
+        # b) Same-digit similarity (mean across digits 1–9)
+        digit_sims: List[float] = []
+        for digit in range(1, 10):
+            dmask = empty_labels == digit
+            if dmask.sum() < 2:
+                continue
+            dstates = normed[dmask]
+            Sd = min(200, dstates.shape[0])
+            didx = torch.randperm(dstates.shape[0])[:Sd]
+            dsample = dstates[didx]                      # [Sd, d]
+            dsim = dsample @ dsample.T                   # [Sd, Sd]
+            doff = ~torch.eye(Sd, dtype=torch.bool)
+            digit_sims.append(dsim[doff].mean().item())
+        if digit_sims:
+            metrics["repr/same_digit_similarity"] = sum(digit_sims) / len(digit_sims)
+
+        # c) Effective rank via SVD (90% variance threshold)
+        pca_n = min(pca_sample, E)
+        pidx = torch.randperm(E)[:pca_n]
+        pca_states = empty_states[pidx].float()          # [pca_n, d]
+        centered = pca_states - pca_states.mean(dim=0)
+        try:
+            _, S_vals, _ = torch.linalg.svd(centered, full_matrices=False)
+            var_ratio = (S_vals ** 2).cumsum(0) / (S_vals ** 2).sum()
+            effective_rank = int((var_ratio < 0.9).sum().item()) + 1
+            metrics["repr/effective_rank"] = float(effective_rank)
+        except Exception:
+            pass
+
+        # d) State norm statistics (all empty cells)
+        state_norms = empty_states.norm(dim=-1)           # [E]
+        metrics["repr/state_norm_mean"] = state_norms.mean().item()
+        metrics["repr/state_norm_std"] = state_norms.std().item()
 
         return metrics
 
