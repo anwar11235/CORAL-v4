@@ -236,6 +236,52 @@ def test_grid_attention_masks_structure_9x9():
 # Smoke test: overfit on single sample
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Pre-norm correctness (Fix 2 — Session 10)
+# ---------------------------------------------------------------------------
+
+def test_transformer_layer_prenorm_residual_preserved():
+    """Pre-norm: output must differ from sublayer output alone (residual is preserved)."""
+    from coral.model.backbone import TransformerLayer
+    layer = TransformerLayer(d_model=64, n_heads=4)
+    layer.eval()
+    x = torch.randn(2, 9, 64)
+    with torch.no_grad():
+        out = layer(x)
+    # With residual: out = x + f(norm(x)), so ||out - x|| < ||out||
+    # Without residual the output would be f(norm(x)) which has unit-ish norm.
+    # The residual stream should be larger than a zero-residual output.
+    assert out.shape == x.shape
+    # Residual means output is correlated with input
+    corr = (out * x).sum() / (out.norm() * x.norm() + 1e-8)
+    assert corr.item() > 0.0, "Pre-norm residual output should be positively correlated with input"
+
+
+def test_transformer_layer_prenorm_norm_applied_before_sublayer():
+    """Verify norm is applied to x, not to x + sublayer(x)."""
+    from coral.model.backbone import TransformerLayer
+    import torch.nn.functional as F
+    layer = TransformerLayer(d_model=64, n_heads=4)
+    layer.eval()
+
+    x = torch.randn(1, 4, 64)
+    with torch.no_grad():
+        # Manually replicate the pre-norm formula
+        x_normed = layer.norm1(x)
+        attn_out = layer.attn(x_normed)
+        after_attn = x + attn_out
+        x_normed2 = layer.norm2(after_attn)
+        ffn_out = layer.ffn(x_normed2)
+        expected = after_attn + ffn_out
+
+        actual = layer(x)
+
+    assert torch.allclose(actual, expected, atol=1e-5), (
+        "TransformerLayer output does not match pre-norm formula: "
+        "x + attn(norm1(x)), then x + ffn(norm2(x))"
+    )
+
+
 def test_backbone_smoke_overfit():
     """Backbone should be able to overfit on a single (x, y) pair within 100 steps."""
     config = ModelConfig(backbone_dim=64, n_heads=4, backbone_layers=2, ffn_expansion=4,

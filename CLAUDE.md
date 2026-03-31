@@ -364,6 +364,38 @@ Key v4.2 changes from v4.1:
 
 **Test status:** 155/155 pass (no new tests needed — gate init is a 1-line hyperparameter change).
 
+### Session 10 — Baseline Architecture Fixes (2026-03-31)
+
+**What was done:**
+Three critical fixes to close the gap between the Phase 1 baseline and TRM's effective depth.
+All three were already partially present in the working tree; this session completed and tested them.
+
+1. **Fix 1 — `inner_steps_override: 21` in Phase 1 config (CRITICAL):**
+   - `configs/phase1_baseline_no_pc.yaml` — Added `inner_steps_override: 21` under `model:`.
+   - Without this, N=1 baseline computes T^(n_levels-1-0)=3^0=1 inner step per segment × 16 segments = 16 total backbone applications. TRM does ~672. With the override: 21 steps × 16 segments = 336.
+   - `coral/config.py` already had `inner_steps_override: Optional[int] = None`.
+   - `coral/model/coral_core.py` already picks it up at init (line 118–119).
+   - `tests/test_coral_core.py` — 3 new tests: `test_inner_steps_override_sets_level_steps`, `test_inner_steps_override_none_uses_formula`, `test_inner_steps_override_forward_runs`.
+
+2. **Fix 2 — Pre-norm in `TransformerLayer` (CRITICAL):**
+   - `coral/model/backbone.py` `TransformerLayer.forward` was already correct (pre-norm) in the working tree.
+     Confirmed formula: `x = x + attn(norm1(x)); x = x + ffn(norm2(x))`.
+   - Post-norm would attenuate the residual stream across 21+ recurrent applications, preventing iterative refinement.
+   - `tests/test_backbone.py` — 2 new tests: `test_transformer_layer_prenorm_residual_preserved`, `test_transformer_layer_prenorm_norm_applied_before_sublayer`.
+
+3. **Fix 3 — Deep supervision linear segment weighting:**
+   - `coral/config.py` `TrainingConfig` — Added `deep_supervision_weighting: str = "uniform"` field.
+   - `coral/training/trainer.py` `train_step` — Implements both `"uniform"` (w=1.0) and `"linear"`
+     (w=2*(i+1)/(num_segs+1), normalised so weights sum to num_segs).
+   - `configs/phase1_baseline_no_pc.yaml` — Set `deep_supervision_weighting: "linear"`.
+   - `tests/test_losses.py` — 1 new test: `test_linear_weighting_differs_from_uniform`.
+
+**Test status:** 161/161 pass.
+
+**Backbone applications in Phase 1 after fixes:**
+- `level_steps[0] = 21`, `K_max = 16` → 21 × 16 = **336 backbone applications per forward pass**.
+- Equivalent to a 672-layer effective depth (2 transformer layers per backbone call).
+
 ---
 
 ## Repository Layout

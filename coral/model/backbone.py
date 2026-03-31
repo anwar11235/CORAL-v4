@@ -8,7 +8,7 @@ Architecture:
   - 2 transformer layers
   - d_model=512, n_heads=8, d_k=64
   - SwiGLU FFN with 4× expansion
-  - RMSNorm (post-norm, no learnable parameters)
+  - RMSNorm (pre-norm, no learnable parameters)
   - Rotary position encoding (RoPE)
   - PyTorch SDPA attention (no flash-attn dependency)
 """
@@ -172,7 +172,12 @@ class SwiGLUFFN(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    """Single transformer layer: attention + FFN, post-norm."""
+    """Single transformer layer: attention + FFN, pre-norm.
+
+    Pre-norm allows the residual stream to grow freely across recurrence steps
+    while only normalising sublayer inputs. This is critical for iterative
+    architectures where the same block is applied many times (21+ steps).
+    """
 
     def __init__(self, d_model: int, n_heads: int, ffn_expansion: int = 4) -> None:
         super().__init__()
@@ -182,8 +187,8 @@ class TransformerLayer(nn.Module):
         self.norm2 = RMSNorm(d_model)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = self.norm1(x + self.attn(x, mask=mask))
-        x = self.norm2(x + self.ffn(x))
+        x = x + self.attn(self.norm1(x), mask=mask)
+        x = x + self.ffn(self.norm2(x))
         return x
 
 

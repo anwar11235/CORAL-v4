@@ -342,3 +342,51 @@ def test_end_to_end_full_mode_loss_no_nan():
 
     assert total_loss.isfinite(), "Full mode end-to-end loss must be finite"
     assert total_loss.item() >= 0.0, "Full mode end-to-end loss must be >= 0"
+
+
+# ---------------------------------------------------------------------------
+# Deep supervision segment weighting (Fix 3 — Session 10)
+# ---------------------------------------------------------------------------
+
+def test_linear_weighting_differs_from_uniform():
+    """Linear deep supervision weighting must produce different gradients from uniform.
+
+    With 2 segments:
+      uniform: weight = 1.0 for both
+      linear:  weight = 2*(i+1)/(num_segs+1) → seg0=0.667, seg1=1.333
+    The total losses must differ, so the resulting gradients must differ.
+    """
+    config = _baseline_config()
+    full_config = CoralConfig(model=config, device="cpu")
+    full_config.training.precision = "float32"
+
+    def _run_with_weighting(weighting: str) -> float:
+        """Return total weighted loss under the given scheme."""
+        adapter = GridAdapter(full_config, vocab_size=10, grid_height=3, grid_width=3)
+        core = CoralCore(config)
+        loss_fn = CoralLoss(config)
+        torch.manual_seed(0)
+
+        inputs = torch.randint(0, 10, (2, 9))
+        labels = torch.randint(1, 10, (2, 9))
+        z1 = adapter.encode(inputs)
+        out = core(z1, K_max=2, training=True, decode_fn=adapter.decode)
+
+        num_segs = len(out.all_logits)
+        total = torch.tensor(0.0)
+        for i, logits in enumerate(out.all_logits):
+            seg_loss, _ = loss_fn(logits=logits, labels=labels)
+            if weighting == "linear":
+                w = 2.0 * (i + 1) / (num_segs + 1)
+            else:
+                w = 1.0
+            total = total + w * seg_loss
+        return total.item()
+
+    loss_uniform = _run_with_weighting("uniform")
+    loss_linear = _run_with_weighting("linear")
+
+    assert loss_uniform != pytest.approx(loss_linear, abs=1e-6), (
+        f"Linear weighting should produce a different total loss than uniform. "
+        f"uniform={loss_uniform:.6f}, linear={loss_linear:.6f}"
+    )

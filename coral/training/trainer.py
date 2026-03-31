@@ -103,6 +103,9 @@ class TrainerV4:
             total_loss = torch.tensor(0.0, device=self.device)
             all_breakdowns = []
 
+            num_segs = len(output.all_logits)
+            weighting = getattr(self.config.training, "deep_supervision_weighting", "uniform")
+
             for i, logits in enumerate(output.all_logits):
                 seg_loss, breakdown = self.loss_fn(
                     logits=logits,
@@ -115,7 +118,13 @@ class TrainerV4:
                     commitment_loss=output.commit_losses[i] if output.commit_losses else None,
                     disentanglement_loss=output.dis_losses[i] if output.dis_losses else None,
                 )
-                total_loss = total_loss + seg_loss
+                if weighting == "linear":
+                    # weight_i = (i+1) / num_segs, normalised so sum == num_segs
+                    # => weight_i = 2*(i+1) / (num_segs+1)
+                    weight = 2.0 * (i + 1) / (num_segs + 1)
+                else:
+                    weight = 1.0
+                total_loss = total_loss + weight * seg_loss
                 all_breakdowns.append(breakdown)
 
         self.optimizer.zero_grad()

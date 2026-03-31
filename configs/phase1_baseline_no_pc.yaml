@@ -16,6 +16,9 @@ model:
 
   # Timescale: T=3 inner steps per segment (all at level 1)
   timescale_base: 3
+  # N=1 baseline: T^(n_levels-1-0) = 3^0 = 1 step, so override to 21 to match TRM depth.
+  # 21 inner steps × 16 segments = 336 total backbone applications.
+  inner_steps_override: 21
 
   # Predictive coding — OFF in baseline mode
   use_predictive_coding: false
@@ -80,6 +83,9 @@ training:
 
   compile_model: false
   compile_dynamic: false
+
+  # Weight later segments more heavily — early segments have barely iterated
+  deep_supervision_weighting: "linear"
 
 data:
   dataset: sudoku_extreme_1k

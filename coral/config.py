@@ -122,6 +122,12 @@ class TrainingConfig:
     amort_anneal_start: int = 0
     amort_anneal_end: int = 0
 
+    # Deep supervision segment weighting:
+    #   "uniform" — all segments contribute equally (weight = 1.0)
+    #   "linear"  — weight = (i+1)/num_segments, normalised so weights sum to num_segments.
+    #               Later segments receive more gradient; early weak outputs are down-weighted.
+    deep_supervision_weighting: str = "uniform"
+
 
 @dataclass
 class DataConfig:
