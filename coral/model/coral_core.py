@@ -115,6 +115,8 @@ class CoralCore(nn.Module):
         self.level_steps = [
             self.T ** (self.n_levels - 1 - i) for i in range(self.n_levels)
         ]
+        if getattr(config, 'inner_steps_override', None) is not None:
+            self.level_steps[0] = config.inner_steps_override
 
         # Shared backbone (weight-shared across all levels and steps)
         self.backbone = CoralBackbone(config)
@@ -138,7 +140,7 @@ class CoralCore(nn.Module):
 
         # Level and timescale embeddings
         self.level_emb = LevelEmbedding(config.n_levels, config.backbone_dim)
-        max_steps = self.T ** (self.n_levels - 1) + 4
+        max_steps = max(self.T ** (self.n_levels - 1), getattr(config, 'inner_steps_override', None) or 0) + 4
         self.timescale_emb = TimescaleEmbedding(config.backbone_dim, max_steps=max_steps)
 
         # Halting network

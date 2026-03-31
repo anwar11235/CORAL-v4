@@ -335,3 +335,54 @@ def test_detach_between_segments():
         z_states = [z.detach() for z in out.z_states]
 
     total_loss.backward()  # Should not OOM or error
+
+
+# ---------------------------------------------------------------------------
+# inner_steps_override
+# ---------------------------------------------------------------------------
+
+def _baseline_n1_config(**kwargs) -> ModelConfig:
+    return ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=10, mode="baseline",
+        **kwargs,
+    )
+
+
+def test_inner_steps_override_sets_level_steps():
+    """With inner_steps_override=21 and n_levels=1, level_steps[0] must equal 21."""
+    config = _baseline_n1_config(inner_steps_override=21)
+    core = CoralCore(config)
+    assert core.level_steps[0] == 21, (
+        f"Expected level_steps[0]=21 with inner_steps_override=21, got {core.level_steps[0]}"
+    )
+
+
+def test_inner_steps_override_none_uses_formula():
+    """With inner_steps_override=None, level_steps[0] must equal T^(n_levels-1)=3^0=1."""
+    config = _baseline_n1_config(inner_steps_override=None)
+    core = CoralCore(config)
+    expected = config.timescale_base ** (config.n_levels - 1)  # 3^0 = 1
+    assert core.level_steps[0] == expected, (
+        f"Expected level_steps[0]={expected} with override=None, got {core.level_steps[0]}"
+    )
+
+
+def test_inner_steps_override_forward_runs():
+    """Forward pass must complete without error with inner_steps_override=21, n_levels=1."""
+    config = _baseline_n1_config(inner_steps_override=21)
+    full_config = CoralConfig(model=config, device="cpu")
+    full_config.training.precision = "float32"
+    core = CoralCore(config)
+    adapter = GridAdapter(full_config, vocab_size=10, grid_height=3, grid_width=3)
+
+    inputs = torch.randint(0, 10, (2, 9))
+    z1 = adapter.encode(inputs)
+    with torch.no_grad():
+        out = core(z1, K_max=2, training=False, decode_fn=adapter.decode)
+
+    assert out.z_states[0].shape == (2, 9, 64), (
+        f"Unexpected output shape: {out.z_states[0].shape}"
+    )

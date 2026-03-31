@@ -65,6 +65,11 @@ class ModelConfig:
     # experiment configs to enable the learned row/col/box attention bias.
     use_local_attention_bias: bool = False  # learned row/col/box attention bias scalars
 
+    # Inner steps override: when set, level_steps[0] is forced to this value
+    # regardless of the timescale formula. Useful for N=1 configs where the
+    # formula gives T^0=1 step but more steps are desired (e.g. 21 to match TRM).
+    inner_steps_override: Optional[int] = None
+
     # Operating mode — controls which forward path is used:
     #   "baseline" : no predictive coding, level-1 only, T inner steps per segment
     #   "pc_only"  : predictive coding with running-statistics precision (v4.1 behaviour)
