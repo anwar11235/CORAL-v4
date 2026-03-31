@@ -289,6 +289,51 @@ enforces on the already-detached state, so backbone gradients are never cut duri
 
 **Test status:** 111/111 pass.
 
+### Session 8 — Full Test Suite Update (2026-03-30)
+
+**What was done:**
+1. **`tests/test_backbone.py`** — Added 3 attention bias tests:
+   - `test_backbone_attention_bias_changes_output` — non-uniform bias changes outputs
+   - `test_backbone_none_bias_identical_to_no_bias` — `attention_bias=None` backward compatible
+   - `test_grid_attention_masks_structure_9x9` — 9×9 mask shape/symmetry/binary/diagonal checks
+
+2. **`tests/test_crystallisation.py`** — Added 2 missing tests:
+   - `test_initialise_from_kmeans_changes_codebook` — k-means init replaces random entries
+   - `test_get_perplexity_shape_and_range` — perplexity is [H] tensor in [1, entries_per_head]
+
+3. **`tests/test_coral_core.py`** — Added 6 tests covering all three modes:
+   - `test_all_modes_output_shape[baseline/pc_only/full]` — correct z_states[0] shape
+   - `test_all_modes_backward[baseline/pc_only/full]` — backward completes, backbone grads present
+   - `test_full_mode_crystal_stats_in_coral_core` — crystal_stats length == num_segments
+   - `test_baseline_mode_no_pc_modules` — baseline has zero PC modules
+   - `test_full_mode_no_crystallisation_manager_when_disabled` — manager is None for pc_only
+
+4. **`tests/test_forward_backward.py`** — Added 3 per-mode gradient tests:
+   - `test_baseline_mode_grads_reach_backbone` — backbone grads non-zero in baseline
+   - `test_pc_only_mode_grads_reach_backbone_and_prediction_net` — grads in backbone + pred net
+   - `test_full_mode_commit_loss_affects_encoder` — backbone + adapter grads in full mode
+
+5. **`tests/test_losses.py`** — New file, 12 tests:
+   - stablemax CE: finite, non-negative, ignored positions = 0
+   - commitment_loss and disentanglement_loss non-negative
+   - Baseline mode: PC, crystallisation, amort losses all = 0; task loss > 0
+   - `loss/precision_reg` NOT in breakdown (confirms v4.2 removal)
+   - Full mode: commit + dis increase total; total = sum of parts
+   - amortisation_loss: non-negative, empty → 0
+   - End-to-end forward + loss finite in both baseline and full mode
+
+**Test status:** 140/140 pass.
+
+**Parameter counts (N=1 single-level, 9×9 Sudoku):**
+- Baseline mode:           8,492,945 total params (adapter + core)
+- Full mode (+ crystal):   8,492,945 total params (codebook = 16,640 BUFFERS, not params)
+- Codebook learnable params: 0 (confirmed buffers only)
+
+**Smoke tests (programmatic, synthetic data):**
+- phase1_baseline_no_pc: 5 training steps complete, loss = ~2.9 ✓
+- phase3b_crystal_multihead: 5 training steps complete, loss = ~3.1 ✓
+  (crystal stats keys confirmed in metrics)
+
 Key v4.2 changes from v4.1:
 - Learned precision network → running-statistics precision (EMA, no parameters)
 - Learned recognition network → convergence-driven crystallisation (velocity monitoring, no parameters)
@@ -345,13 +390,19 @@ coral-v4/
 │   ├── diagnostic_precision.py        # Legacy: precision diagnostic (1000 steps)
 │   └── diagnostic_no_pc.py            # Legacy: no-PC baseline diagnostic
 │
-├── tests/                             # pytest test suite
-│   ├── test_backbone.py
-│   ├── test_predictive_coding.py
-│   ├── test_crystallisation.py
-│   ├── test_coral_core.py
-│   ├── test_forward_backward.py
-│   └── test_losses.py
+├── tests/                             # pytest test suite (140 tests, all pass)
+│   ├── test_backbone.py               # backbone shape, gradient, attention bias
+│   ├── test_predictive_coding.py      # RunningPrecision, PC module, loss
+│   ├── test_crystallisation.py        # codebook, convergence, decrystallisation, manager
+│   ├── test_coral_core.py             # all 3 modes, shapes, backward
+│   ├── test_forward_backward.py       # per-mode gradient flow
+│   ├── test_losses.py                 # stablemax CE, commit, dis, baseline/full mode
+│   ├── test_full_mode.py              # session 5 full-mode integration tests
+│   ├── test_local_attention_bias.py   # session 2 attention bias tests
+│   ├── test_baseline_mode.py          # session 1 baseline mode tests
+│   ├── test_adapters.py               # grid adapter encode/decode
+│   ├── test_configs.py                # YAML config loading + annealing
+│   └── test_diagnostics.py            # repr diagnostics + codebook analysis
 │
 └── data/                              # Data files (gitignored)
     └── sudoku_extreme_1k/

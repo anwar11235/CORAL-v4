@@ -397,6 +397,39 @@ def test_crystallisation_manager_end_to_end():
     assert "newly_crystallised" in stats
 
 
+def test_initialise_from_kmeans_changes_codebook():
+    """initialise_from_kmeans should replace random codebook entries with k-means centroids."""
+    cb = _make_codebook(dim=64, n_heads=4, entries_per_head=8)
+    codebook_before = cb.codebook.clone()
+
+    # 200 random states — enough for k-means to converge
+    states = torch.randn(200, 64)
+    cb.initialise_from_kmeans(states, n_iter=20)
+
+    # Codebook must have changed
+    assert not torch.allclose(codebook_before, cb.codebook), (
+        "Codebook should change after k-means initialisation"
+    )
+    # Shape preserved
+    assert cb.codebook.shape == codebook_before.shape
+
+
+def test_get_perplexity_shape_and_range():
+    """get_perplexity returns a [H] tensor; all values >= 1.0 and <= entries_per_head."""
+    H, entries, dim = 4, 8, 32
+    cb = MultiHeadedCodebook(dim=dim, n_heads=H, entries_per_head=entries)
+
+    z = torch.randn(4, 5, dim)  # [B, L, dim]
+    _, indices, _ = cb.quantise(z)
+    cb.update_ema(z, indices)
+
+    perp = cb.get_perplexity()
+    assert perp.shape == (H,), f"Expected perplexity shape ({H},), got {perp.shape}"
+    for h in range(H):
+        assert perp[h].item() >= 1.0, f"Perplexity head {h} < 1.0"
+        assert perp[h].item() <= entries + 1e-3, f"Perplexity head {h} > entries_per_head"
+
+
 def test_crystallisation_manager_get_losses():
     """get_losses() returns scalar tensors after a step."""
     config = _make_config()

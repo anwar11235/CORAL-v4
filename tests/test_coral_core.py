@@ -188,6 +188,116 @@ def test_pc_chain_connected(small_config):
 
 
 # ---------------------------------------------------------------------------
+# All three modes: baseline, pc_only, full
+# ---------------------------------------------------------------------------
+
+def _make_mode_config(mode: str) -> ModelConfig:
+    """Minimal config for testing a specific forward-pass mode."""
+    if mode == "full":
+        return ModelConfig(
+            n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+            ffn_expansion=2, timescale_base=2, K_max=2,
+            use_predictive_coding=False, use_crystallisation=True,
+            codebook_heads=4, codebook_entries_per_head=8,
+            epsilon_min=0.01, lambda_pred=0.001, vocab_size=10, mode="full",
+        )
+    elif mode == "pc_only":
+        return ModelConfig(
+            n_levels=2, level_dims=[64, 32], backbone_dim=64, n_heads=4, d_k=16,
+            ffn_expansion=2, timescale_base=2, K_max=2,
+            use_predictive_coding=True, use_crystallisation=False,
+            epsilon_min=0.01, lambda_pred=0.001, vocab_size=10, mode="pc_only",
+        )
+    else:  # baseline
+        return ModelConfig(
+            n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+            ffn_expansion=2, timescale_base=2, K_max=2,
+            use_predictive_coding=False, use_crystallisation=False,
+            epsilon_min=0.01, lambda_pred=0.001, vocab_size=10, mode="baseline",
+        )
+
+
+@pytest.mark.parametrize("mode", ["baseline", "pc_only", "full"])
+def test_all_modes_output_shape(mode):
+    """All three modes should produce z_states[0] with the correct shape."""
+    config = _make_mode_config(mode)
+    core = CoralCore(config)
+    core.eval()
+
+    B, L, d = 2, 9, 64
+    z1 = torch.randn(B, L, d)
+    with torch.no_grad():
+        out = core(z1, K_max=2, training=False, decode_fn=None)
+
+    assert out.z_states[0].shape == (B, L, d), (
+        f"mode={mode}: expected z_states[0] shape ({B},{L},{d}), got {out.z_states[0].shape}"
+    )
+    assert out.num_segments >= 1, f"mode={mode}: num_segments should be >= 1"
+
+
+@pytest.mark.parametrize("mode", ["baseline", "pc_only", "full"])
+def test_all_modes_backward(mode):
+    """Backward pass should complete without error in all three modes."""
+    config = _make_mode_config(mode)
+    full_config = CoralConfig(model=config, device="cpu")
+    full_config.training.precision = "float32"
+
+    adapter = GridAdapter(full_config, vocab_size=10, grid_height=3, grid_width=3)
+    core = CoralCore(config)
+    loss_fn = CoralLoss(config)
+
+    inputs = torch.randint(0, 10, (2, 9))
+    labels = torch.randint(1, 10, (2, 9))
+    z1 = adapter.encode(inputs)
+
+    out = core(z1, K_max=2, training=True, decode_fn=adapter.decode)
+
+    total_loss = torch.tensor(0.0)
+    for i, logits in enumerate(out.all_logits):
+        seg_loss, _ = loss_fn(
+            logits=logits, labels=labels,
+            commitment_loss=out.commit_losses[i] if out.commit_losses else None,
+            disentanglement_loss=out.dis_losses[i] if out.dis_losses else None,
+        )
+        total_loss = total_loss + seg_loss
+
+    total_loss.backward()  # Must not raise
+
+    # Backbone must have received gradient signal
+    for name, param in core.backbone.named_parameters():
+        assert param.grad is not None, f"mode={mode}: backbone.{name} missing gradient"
+
+
+def test_full_mode_crystal_stats_in_coral_core():
+    """In mode='full' with crystallisation, crystal_stats should be non-empty."""
+    config = _make_mode_config("full")
+    core = CoralCore(config)
+    core.eval()
+
+    z1 = torch.randn(2, 9, 64)
+    with torch.no_grad():
+        out = core(z1, K_max=2, training=False, decode_fn=None)
+
+    assert len(out.crystal_stats) == out.num_segments, (
+        "crystal_stats should have one entry per segment"
+    )
+
+
+def test_baseline_mode_no_pc_modules():
+    """In mode='baseline', pc_modules should be empty."""
+    config = _make_mode_config("baseline")
+    core = CoralCore(config)
+    assert len(core.pc_modules) == 0, "baseline mode must have zero PC modules"
+
+
+def test_full_mode_no_crystallisation_manager_when_disabled():
+    """crystallisation_manager should be None when use_crystallisation=False."""
+    config = _make_mode_config("pc_only")
+    core = CoralCore(config)
+    assert core.crystallisation_manager is None
+
+
+# ---------------------------------------------------------------------------
 # Detach between segments
 # ---------------------------------------------------------------------------
 

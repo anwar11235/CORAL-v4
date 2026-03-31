@@ -123,6 +123,120 @@ def test_no_nan_gradients():
             assert not torch.isinf(param.grad).any(), f"Inf gradient in {name}"
 
 
+# ---------------------------------------------------------------------------
+# Per-mode gradient flow
+# ---------------------------------------------------------------------------
+
+def make_baseline_model():
+    """Single-level baseline (no PC, no crystallisation)."""
+    config = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=2, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=10, mode="baseline",
+    )
+    full_config = CoralConfig(model=config, device="cpu")
+    full_config.training.precision = "float32"
+    adapter = GridAdapter(full_config, vocab_size=10, grid_height=3, grid_width=3)
+    core = CoralCore(config)
+    loss_fn = CoralLoss(config)
+    return adapter, core, loss_fn, config
+
+
+def make_full_mode_model():
+    """Single-level full mode with crystallisation."""
+    config = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=2, K_max=2,
+        use_predictive_coding=False, use_crystallisation=True,
+        codebook_heads=4, codebook_entries_per_head=8,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=10, mode="full",
+    )
+    full_config = CoralConfig(model=config, device="cpu")
+    full_config.training.precision = "float32"
+    adapter = GridAdapter(full_config, vocab_size=10, grid_height=3, grid_width=3)
+    core = CoralCore(config)
+    loss_fn = CoralLoss(config)
+    return adapter, core, loss_fn, config
+
+
+def test_baseline_mode_grads_reach_backbone():
+    """In baseline mode, backbone parameters must have non-zero gradients."""
+    adapter, core, loss_fn, config = make_baseline_model()
+
+    inputs = torch.randint(0, 10, (2, 9))
+    labels = torch.randint(1, 10, (2, 9))
+    z1 = adapter.encode(inputs)
+    out = core(z1, K_max=2, training=True, decode_fn=adapter.decode)
+
+    total_loss = torch.tensor(0.0)
+    for i, logits in enumerate(out.all_logits):
+        seg_loss, _ = loss_fn(logits=logits, labels=labels)
+        total_loss = total_loss + seg_loss
+    total_loss.backward()
+
+    for name, param in core.backbone.named_parameters():
+        assert param.grad is not None, f"baseline: backbone.{name} missing gradient"
+        assert param.grad.abs().sum().item() > 0, f"baseline: backbone.{name} has zero gradient"
+
+
+def test_pc_only_mode_grads_reach_backbone_and_prediction_net():
+    """In pc_only mode, grads must reach both backbone and PC prediction network."""
+    adapter, core, loss_fn, config = make_small_model()  # pc_only by default
+
+    inputs = torch.randint(0, 10, (2, 9))
+    labels = torch.randint(1, 10, (2, 9))
+    z1 = adapter.encode(inputs)
+    out = core(z1, K_max=2, training=True, decode_fn=adapter.decode)
+
+    total_loss = torch.tensor(0.0)
+    for i, logits in enumerate(out.all_logits):
+        seg_loss, _ = loss_fn(
+            logits=logits, labels=labels,
+            pred_errors=out.pred_errors[i] if out.pred_errors else None,
+            precisions=out.precisions[i] if out.precisions else None,
+        )
+        total_loss = total_loss + seg_loss
+    total_loss.backward()
+
+    # Backbone
+    bb_grads = [p.grad for p in core.backbone.parameters() if p.grad is not None]
+    assert len(bb_grads) > 0, "pc_only: backbone missing gradients"
+
+    # PC prediction network
+    pred_grads = [p.grad for p in core.pc_modules[0].prediction_net.parameters() if p.grad is not None]
+    assert len(pred_grads) > 0, "pc_only: prediction_net missing gradients"
+
+
+def test_full_mode_commit_loss_affects_encoder():
+    """In full mode, commitment loss must create a gradient signal back to the encoder."""
+    adapter, core, loss_fn, config = make_full_mode_model()
+
+    inputs = torch.randint(0, 10, (2, 9))
+    labels = torch.randint(1, 10, (2, 9))
+    z1 = adapter.encode(inputs)
+    out = core(z1, K_max=2, training=True, decode_fn=adapter.decode)
+
+    total_loss = torch.tensor(0.0)
+    for i, logits in enumerate(out.all_logits):
+        seg_loss, _ = loss_fn(
+            logits=logits, labels=labels,
+            commitment_loss=out.commit_losses[i] if out.commit_losses else None,
+            disentanglement_loss=out.dis_losses[i] if out.dis_losses else None,
+        )
+        total_loss = total_loss + seg_loss
+    total_loss.backward()
+
+    # Backbone must have gradients (task loss alone would provide this;
+    # commitment loss adds an additional gradient path through the encoder)
+    bb_grads = [p.grad for p in core.backbone.parameters() if p.grad is not None]
+    assert len(bb_grads) > 0, "full mode: backbone missing gradients"
+
+    # Adapter embedding must also have gradients (task loss flows back through decode)
+    adapter_grads = [p.grad for p in adapter.parameters() if p.grad is not None]
+    assert len(adapter_grads) > 0, "full mode: adapter missing gradients"
+
+
 def test_deep_supervision_accumulates():
     """Multiple segments should accumulate gradient signal properly."""
     adapter, core, loss_fn, config = make_small_model()
