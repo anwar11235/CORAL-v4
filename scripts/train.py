@@ -34,6 +34,7 @@ from coral.data.sudoku_dataset import create_sudoku_dataloader
 from coral.evaluation.evaluator import evaluate_accuracy
 from coral.evaluation.pareto import evaluate_pareto
 from coral.model.coral_core import CoralCore
+from coral.training.annealing import get_effective_lambda_amort
 from coral.training.losses import CoralLoss
 from coral.training.optimizer import build_scheduler
 from coral.training.trainer import TrainerV4
@@ -134,6 +135,34 @@ def main(cfg: DictConfig) -> None:
         wandb_run=wandb_run,
     )
 
+    # ---- Codebook initialisation from k-means centroids (optional) ----
+    init_path = config.training.codebook_init_from
+    if (
+        init_path is not None
+        and config.model.use_crystallisation
+        and core.crystallisation_manager is not None
+    ):
+        log.info(f"Initialising codebook from k-means centroids: {init_path}")
+        try:
+            raw = np.load(init_path, mmap_mode=None)
+            states_all = raw["states"].copy()   # [N, L, n_segs, d]
+            raw.close()
+
+            # Use the last segment's states (most refined representations)
+            N, L, n_segs, d = states_all.shape
+            states_flat = states_all[:, :, -1, :].reshape(N * L, d)
+
+            # Initialise using per-head k-means (run on CPU, weights on device)
+            states_tensor = torch.from_numpy(states_flat).float()
+            core.crystallisation_manager.codebook.initialise_from_kmeans(states_tensor)
+            log.info(
+                f"Codebook initialised from {states_flat.shape[0]} states "
+                f"({config.model.codebook_heads} heads × "
+                f"{config.model.codebook_entries_per_head} entries)"
+            )
+        except Exception as e:
+            log.warning(f"Codebook initialisation failed (continuing without): {e}")
+
     # Build LR scheduler
     total_steps = config.training.epochs
     scheduler = build_scheduler(
@@ -153,8 +182,21 @@ def main(cfg: DictConfig) -> None:
             scheduler.step()
             step = trainer.step
 
+            # Amortisation annealing — update loss_fn's effective weight each step
+            eff_lambda = 0.0
+            if config.model.use_amort:
+                eff_lambda = get_effective_lambda_amort(
+                    step=step,
+                    base=config.model.lambda_amort,
+                    anneal_start=config.training.amort_anneal_start,
+                    anneal_end=config.training.amort_anneal_end,
+                )
+                trainer.loss_fn.config.lambda_amort = eff_lambda
+
             # Log to W&B
             if step % config.training.log_every == 0:
+                if config.model.use_amort:
+                    metrics["train/lambda_amort"] = eff_lambda
                 if wandb_run is not None:
                     wandb_run.log(metrics, step=step)
                 log.info(

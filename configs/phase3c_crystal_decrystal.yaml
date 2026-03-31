@@ -1,0 +1,116 @@
+# CORAL v4.2 — Phase 3c: Multi-headed crystallisation with de-crystallisation tuning
+# Goal: test de-crystallisation sensitivity. Uses tighter tau_converge and looser
+# tau_decrystallise compared to 3b, allowing faster crystallisation and slower release.
+# Mode: "full" — same as 3b but with tuned convergence thresholds.
+
+model:
+  # Single level: d=512
+  n_levels: 1
+  level_dims: [512]
+
+  # Backbone
+  backbone_layers: 2
+  backbone_dim: 512
+  n_heads: 8
+  d_k: 64
+  ffn_expansion: 4
+
+  # Timescale: T=3 inner steps per segment
+  timescale_base: 3
+
+  # Predictive coding — OFF in phase 3 (crystallisation-first research order)
+  use_predictive_coding: false
+  lambda_pred: 0.001
+  lambda_pi: 0.001   # deprecated in v4.2, kept for compat
+  epsilon_min: 0.01
+
+  # Halting
+  K_max: 16
+  halting_threshold: 0.95
+  halting_exploration_prob: 0.1
+  halting_gamma: 0.9
+
+  # v4.2 mode flag
+  mode: "full"
+
+  # Crystallisation — multi-headed with tuned thresholds
+  use_crystallisation: true
+  codebook_heads: 8
+  codebook_entries_per_head: 32
+  tau_converge: 0.005     # tighter: crystallise sooner (faster convergence required)
+  tau_decrystallise: 0.1  # looser: higher tolerance before releasing frozen heads
+  n_stable: 3             # require 3 stable segments (more conservative than 3b)
+  lambda_commit: 0.25
+  lambda_dis: 0.01
+  lambda_crystal: 0.0
+
+  # No amortisation in phase 3
+  use_amort: false
+  lambda_amort: 0.0
+
+  # Other components
+  use_column_heads: false
+  use_stochastic: false
+
+  # Precision
+  precision_momentum: 0.99
+
+  # Attention bias
+  use_local_attention_bias: true
+
+  # Adapter
+  vocab_size: 11
+
+training:
+  epochs: 20000
+  batch_size: 64
+  learning_rate: 7e-5
+  weight_decay: 1.0
+  betas: [0.9, 0.95]
+  gradient_clip: 1.0
+  scheduler: cosine
+  warmup_steps: 500
+
+  # Mixed precision
+  precision: bfloat16
+  loss_precision: float64
+
+  full_inner_backprop: true
+
+  # Evaluation
+  eval_every: 500
+  pareto_eval_every: 5000
+  quick_eval_samples: 100
+  log_every: 50
+
+  optimizer: adamw
+
+  compile_model: false
+  compile_dynamic: false
+
+  # Codebook initialisation from Phase 1 collected states (optional)
+  codebook_init_from: null
+
+  # Amortisation annealing (disabled in phase 3)
+  amort_anneal_start: 0
+  amort_anneal_end: 0
+
+data:
+  dataset: sudoku_extreme_1k
+  dataset_path: data/sudoku_extreme_1k
+  augmentation_factor: 1000
+  eval_size: 1000
+  num_workers: 4
+  seq_len: 81
+
+wandb:
+  project: "Sudoku-extreme-1k-aug-1000 CORAL-v4"
+  entity: aktuator-ai
+  run_name: v4.2-phase3c-crystal-decrystal
+  tags: ["v4.2", "phase3c", "full", "crystallisation", "decrystallisation", "threshold-tuning"]
+  log_every: 50
+  disabled: false
+
+seed: 42
+device: cuda
+experiment_name: phase3c_crystal_decrystal

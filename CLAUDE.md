@@ -253,6 +253,42 @@ enforces on the already-detached state, so backbone gradients are never cut duri
 
 **Test status:** 89/89 pass.
 
+### Session 7 — Updated Configs + Training Scripts (2026-03-30)
+
+**What was done:**
+1. **`coral/config.py`** — Added 3 new `TrainingConfig` fields:
+   - `codebook_init_from: Optional[str] = None` — path to `.npz` from `collect_states.py` for k-means codebook init
+   - `amort_anneal_start: int = 0` — step at which `lambda_amort` ramp begins
+   - `amort_anneal_end: int = 0` — step at which `lambda_amort` reaches full value (0 = no annealing)
+
+2. **`coral/training/annealing.py`** — New module:
+   - `get_effective_lambda_amort(step, base, anneal_start, anneal_end) -> float`
+   - Linearly ramps from 0 → `base` over `[anneal_start, anneal_end]`; immediate when `anneal_end=0`.
+
+3. **Config YAML files** — 5 new phase configs created:
+   - `configs/phase3a_crystal_simple.yaml` — mode="full", n_levels=1, codebook_heads=1, entries=256, lambda_dis=0.0
+   - `configs/phase3b_crystal_multihead.yaml` — same + codebook_heads=8, entries=32, lambda_dis=0.01
+   - `configs/phase3c_crystal_decrystal.yaml` — same as 3b with tau_converge=0.005, tau_decrystallise=0.1, n_stable=3
+   - `configs/phase4_amort_with_crystal.yaml` — same as 3b + use_amort=True, lambda_amort=0.01, anneal 2000→8000
+   - `configs/phase4_amort_no_crystal.yaml` — mode="baseline", use_crystallisation=False + use_amort=True, annealing
+
+4. **`scripts/train.py`** — Updated with:
+   - Import `get_effective_lambda_amort` from `coral.training.annealing`
+   - Codebook init from k-means: after `TrainerV4` build, loads `.npz` if `training.codebook_init_from` is set,
+     extracts last-segment states, calls `core.crystallisation_manager.codebook.initialise_from_kmeans(states)`.
+   - Amortisation annealing in training loop: calls `get_effective_lambda_amort` each step,
+     sets `trainer.loss_fn.config.lambda_amort = eff_lambda` dynamically.
+   - Logs `train/lambda_amort` when `use_amort=True`.
+
+5. **`tests/test_configs.py`** — 22 tests (all pass):
+   - All 5 YAML files load without error into `CoralConfig`
+   - New `TrainingConfig` fields present with correct types
+   - Per-config assertions: codebook_heads, lambda_dis, mode, use_crystallisation, annealing params
+   - mode="full" forward: correct output shape, crystal_stats populated, backward completes
+   - Annealing: boundary conditions (before start, midpoint, at end, disabled, zero base)
+
+**Test status:** 111/111 pass.
+
 Key v4.2 changes from v4.1:
 - Learned precision network → running-statistics precision (EMA, no parameters)
 - Learned recognition network → convergence-driven crystallisation (velocity monitoring, no parameters)
@@ -284,6 +320,7 @@ coral-v4/
 │   │   └── grid.py                    # Sudoku encoder/decoder + attention bias masks
 │   ├── training/
 │   │   ├── losses.py                  # Stablemax CE + prediction loss + commitment + disentanglement
+│   │   ├── annealing.py               # get_effective_lambda_amort (linear ramp schedule)
 │   │   └── trainer.py                 # Deep supervision loop + W&B logging + repr diagnostics
 │   ├── data/
 │   │   ├── build_sudoku_dataset.py    # Dataset generation (copied from HRM repo)

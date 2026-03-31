@@ -107,6 +107,15 @@ class TrainingConfig:
     compile_model: bool = False
     compile_dynamic: bool = False  # False for Sudoku (fixed L=81)
 
+    # Phase 2: codebook initialisation from k-means centroids
+    codebook_init_from: Optional[str] = None  # path to .npz from collect_states.py; None = skip
+
+    # Phase 4: amortisation loss annealing
+    # lambda_amort linearly ramps from 0 → model.lambda_amort over [anneal_start, anneal_end] steps
+    # When anneal_end == 0 (default), no annealing — lambda_amort is applied at full value from step 0.
+    amort_anneal_start: int = 0
+    amort_anneal_end: int = 0
+
 
 @dataclass
 class DataConfig:
