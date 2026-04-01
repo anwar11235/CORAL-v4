@@ -392,6 +392,45 @@ All three were already partially present in the working tree; this session compl
 
 **Test status:** 161/161 pass.
 
+### Session 11 — Critical Evaluator Bug Fix (2026-03-31)
+
+**The bug:** `coral/evaluation/evaluator.py` reimplemented the forward loop manually
+instead of calling `core.forward()`. The manual loop was missing two critical signals:
+1. `input_injection` — encoder output re-injected at every backbone step so the model
+   always has access to the puzzle constraints (given digits). Without this, the backbone
+   runs blind after segment 0.
+2. `attention_bias` — learned row/col/box structural masks.
+
+The model trained WITH both signals but evaluated WITHOUT them → eval accuracy stuck at
+chance (≈11% token accuracy / 1/9) regardless of training progress.
+
+**Also fixed:** `coral/training/trainer.py` `train_step` and `eval_step` both omitted
+`attention_masks` when calling `core.forward()`. The 3 learned bias scalars (row/col/box)
+were dead parameters — they existed but were never applied. Fixed by building masks once
+in `TrainerV4.__init__` and passing them to every `core.forward()` call.
+
+**What was done:**
+1. **`coral/evaluation/evaluator.py`** — Replaced ~30-line manual segment loop with:
+   ```python
+   output = core(z1, K_max=K_max, training=False, decode_fn=adapter.decode,
+                 attention_masks=attention_masks)
+   ```
+   Attention masks built once before the dataloader loop (static, grid-shape-only).
+
+2. **`coral/training/trainer.py`** — Added `self._attention_masks` built in `__init__`
+   when `use_local_attention_bias=True`. Passed to `core.forward()` in both `train_step`
+   and `eval_step`.
+
+3. **`tests/test_evaluator.py`** — 5 new tests (all pass):
+   - Required metric keys returned
+   - All values in valid ranges
+   - `max_puzzles` limit respected
+   - Regression guard: monkeypatch verifies `_run_level` is NOT called directly from
+     outside `core.forward()` — catches any future reversion to the manual loop
+   - Attention bias path: runs without error when `use_local_attention_bias=True`
+
+**Test status:** 166/166 pass.
+
 **Backbone applications in Phase 1 after fixes:**
 - `level_steps[0] = 21`, `K_max = 16` → 21 × 16 = **336 backbone applications per forward pass**.
 - Equivalent to a 672-layer effective depth (2 transformer layers per backbone call).

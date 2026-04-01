@@ -4,7 +4,7 @@ Computes exact accuracy (full puzzle correct) and token accuracy (per-cell)
 on the Sudoku-Extreme-1K evaluation set.
 """
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -23,6 +23,9 @@ def evaluate_accuracy(
     max_puzzles: Optional[int] = None,
 ) -> Dict[str, float]:
     """Evaluate exact and token accuracy on a full evaluation dataset.
+
+    Uses core.forward() directly so that input_injection and attention_bias
+    are applied identically to the training forward pass.
 
     Args:
         adapter:     GridAdapter for encode/decode.
@@ -46,7 +49,13 @@ def evaluate_accuracy(
     token_total = 0
     total_segments = 0
 
-    from coral.model.halting import should_halt
+    # Build attention masks once (static — depend only on grid shape, not on input).
+    # These are the same masks used during training via trainer.py.
+    attention_masks: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+    if hasattr(adapter, "build_attention_masks") and core.config.use_local_attention_bias:
+        attention_masks = adapter.build_attention_masks(device=device)
+
+    K_max = K_override if K_override is not None else core.config.K_max
 
     with torch.no_grad():
         for batch in dataloader:
@@ -56,48 +65,17 @@ def evaluate_accuracy(
 
             with torch.autocast(device_type=device.type, dtype=dtype):
                 z1 = adapter.encode(inputs)
-                L = z1.shape[1]
-                z_states = [z1]
-                for i in range(1, core.config.n_levels):
-                    d_l = core.config.level_dims[i]
-                    z_states.append(
-                        torch.zeros(B, L, d_l, device=device, dtype=dtype)
-                    )
+                output = core(
+                    z1,
+                    K_max=K_max,
+                    training=False,
+                    decode_fn=adapter.decode,
+                    attention_masks=attention_masks,
+                )
 
-                K_max = K_override if K_override is not None else core.config.K_max
-                num_segs = 0
-
-                for seg in range(K_max):
-                    n_levels = core.config.n_levels
-                    predictions = [None] * n_levels
-                    error_signals = [None] * n_levels
-
-                    if core.config.use_predictive_coding:
-                        for i in range(n_levels - 2, -1, -1):
-                            predictions[i] = core.pc_modules[i].predict(z_states[i + 1])
-
-                    for i in range(n_levels):
-                        cond = predictions[i]
-                        if i > 0 and error_signals[i] is not None:
-                            cond = cond + error_signals[i] if cond is not None else error_signals[i]
-                        n_steps = core.level_steps[i]
-                        z_states[i] = core._run_level(z_states[i], i, n_steps, conditioning=cond)
-                        if core.config.use_predictive_coding and i < n_levels - 1:
-                            _, _, _, _, xi_up = core.pc_modules[i](z_states[i], z_states[i + 1])
-                            error_signals[i + 1] = xi_up
-
-                    h_k, _, _ = core.halting(z_states)
-                    num_segs = seg + 1
-                    z_states = [z.detach() for z in z_states]
-
-                    if K_override is None and should_halt(
-                        h_k, threshold=core.config.halting_threshold,
-                        training=False, exploration_prob=0.0
-                    ):
-                        break
-
-                logits = adapter.decode(z_states[0])
-                preds = logits.argmax(dim=-1)
+            logits = output.all_logits[-1] if output.all_logits else adapter.decode(output.z_states[0])
+            preds = logits.argmax(dim=-1)
+            num_segs = output.num_segments
 
             mask = labels != IGNORE_LABEL_ID
             correct = (preds == labels) & mask

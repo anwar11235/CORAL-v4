@@ -20,7 +20,7 @@ train/eval loop, optimiser, and loss aggregation.
 """
 
 import logging
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -75,6 +75,13 @@ class TrainerV4:
 
         self.step = 0
 
+        # Build attention masks once (static — depend only on grid shape).
+        # Passed to core.forward() so the learned row/col/box bias scalars
+        # are applied consistently during both training and evaluation.
+        self._attention_masks: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+        if hasattr(adapter, "build_attention_masks") and config.model.use_local_attention_bias:
+            self._attention_masks = adapter.build_attention_masks(device=self.device)
+
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """Run one training step (one batch, all segments).
 
@@ -98,6 +105,7 @@ class TrainerV4:
                 K_max=self.core.config.K_max,
                 training=True,
                 decode_fn=self.adapter.decode,
+                attention_masks=self._attention_masks,
             )
 
             total_loss = torch.tensor(0.0, device=self.device)
@@ -180,6 +188,7 @@ class TrainerV4:
                 K_max=K_override if K_override is not None else self.core.config.K_max,
                 training=False,
                 decode_fn=self.adapter.decode,
+                attention_masks=self._attention_masks,
             )
 
         logits = output.all_logits[-1] if output.all_logits else self.adapter.decode(output.z_states[0])
