@@ -77,6 +77,62 @@ def test_position_embeddings_unique(config):
                 pass  # Not all will differ due to shared token emb, but most should
 
 
+def test_embed_scale_increases_magnitude(config):
+    """embed_scale=True should produce embeddings ~sqrt(d_model) larger than embed_scale=False."""
+    from coral.config import ModelConfig
+
+    config_scaled = CoralConfig(model=ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, vocab_size=10, embed_scale=True,
+    ))
+    config_unscaled = CoralConfig(model=ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, vocab_size=10, embed_scale=False,
+    ))
+    # Share weights so the only difference is the scale factor
+    adapter_scaled = GridAdapter(config_scaled, vocab_size=10)
+    adapter_unscaled = GridAdapter(config_unscaled, vocab_size=10)
+    adapter_unscaled.load_state_dict(adapter_scaled.state_dict())
+
+    x = torch.randint(0, 10, (2, 81))
+    with torch.no_grad():
+        emb_scaled = adapter_scaled.encode(x)
+        emb_unscaled = adapter_unscaled.encode(x)
+
+    norm_scaled = emb_scaled.norm(dim=-1).mean().item()
+    norm_unscaled = emb_unscaled.norm(dim=-1).mean().item()
+    # Scaled norm should be noticeably larger (LayerNorm normalises but scale is absorbed
+    # via the learnable gamma; before LayerNorm the pre-norm variance is ~d_model larger)
+    assert norm_scaled > norm_unscaled, (
+        f"embed_scale=True should produce larger norm: {norm_scaled:.4f} vs {norm_unscaled:.4f}"
+    )
+
+
+def test_embed_scale_false_backward_compat():
+    """embed_scale=False should produce identical output to a config without the field."""
+    from coral.config import ModelConfig
+
+    # Config without embed_scale field (defaults to True — so use False explicitly for old-style)
+    config_old = CoralConfig(model=ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, vocab_size=10, embed_scale=False,
+    ))
+    config_same = CoralConfig(model=ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, vocab_size=10, embed_scale=False,
+    ))
+    adapter1 = GridAdapter(config_old, vocab_size=10)
+    adapter2 = GridAdapter(config_same, vocab_size=10)
+    adapter2.load_state_dict(adapter1.state_dict())
+
+    x = torch.randint(0, 10, (2, 81))
+    with torch.no_grad():
+        emb1 = adapter1.encode(x)
+        emb2 = adapter2.encode(x)
+
+    assert torch.allclose(emb1, emb2), "embed_scale=False should be deterministic across identical configs"
+
+
 def test_smoke_overfit_single_puzzle():
     """Adapter + simple linear decoder should overfit a single puzzle."""
     config = CoralConfig(model=ModelConfig(

@@ -6,7 +6,9 @@ back to per-cell token logits.
 Encoding:
   - Token embedding: vocab_size → d_model
   - 2D positional embedding: row_emb + col_emb (both learned)
-  - Optional mask embedding for empty cells (Sudoku: digit 0 = empty)
+  - Optional embed_scale: multiply by sqrt(d_model) before layer norm so the
+    input signal maintains appropriate magnitude relative to the residual stream
+    during deep recurrence (standard LLM practice; matches TRM's embed_scale).
 
 Decoding:
   - Linear: d_1 → vocab_size
@@ -47,6 +49,7 @@ class GridAdapter(BaseAdapter):
         self.grid_height = grid_height
         self.grid_width = grid_width
         self.seq_len = grid_height * grid_width
+        self.embed_scale = getattr(config.model, "embed_scale", True)
 
         # Token embedding
         self.token_emb = nn.Embedding(self.vocab_size, self.d_model)
@@ -96,6 +99,8 @@ class GridAdapter(BaseAdapter):
         pos = (row + col).unsqueeze(0)        # [1, L, d_model]
 
         emb = tok + pos
+        if self.embed_scale:
+            emb = emb * math.sqrt(self.d_model)
         return self.input_norm(emb)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
