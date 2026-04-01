@@ -1,0 +1,109 @@
+# CORAL v4.2 — Phase 1: N=2 hierarchy with partial gradient inner loop
+#
+# Level 0 (d=512): 18 inner steps per segment — 12 no-grad warmup + 6 with grad
+# Level 1 (d=256):  1 inner step per segment  — always fully in-graph (1 < 6)
+#
+# Total backbone apps/segment: 18 + 1 = 19
+# Activations held for backward: 6 × 16 segments (detached between segs)
+# Memory footprint: comparable to 6-step full-grad model at batch=64 on A100-40GB
+#
+# Comparison to TRM: TRM runs H_cycles=3, L_cycles=6 → 18 inner passes per segment,
+# backprop through 1 H-cycle (6 L-cycles). This config mirrors that design.
+
+model:
+  # Two-level hierarchy
+  n_levels: 2
+  level_dims: [512, 256]
+
+  # Backbone
+  backbone_layers: 2
+  backbone_dim: 512
+  n_heads: 8
+  d_k: 64
+  ffn_expansion: 4
+
+  # Level 0: 18 inner steps (12 no-grad warmup + 6 with grad)
+  timescale_base: 3
+  inner_steps_override: 18
+  grad_inner_steps: 6          # last 6 of level 0's 18 steps have gradient
+
+  # Predictive coding — OFF
+  use_predictive_coding: false
+  lambda_pred: 0.001
+  lambda_pi: 0.001
+  epsilon_min: 0.01
+
+  # Halting
+  K_max: 16
+  halting_threshold: 0.95
+  halting_exploration_prob: 0.1
+  halting_gamma: 0.9
+
+  mode: "baseline"
+
+  use_crystallisation: false
+  use_column_heads: false
+  use_stochastic: false
+  use_amort: false
+  lambda_amort: 0.0
+  lambda_crystal: 0.0
+  lambda_commit: 0.25
+
+  codebook_heads: 8
+  codebook_entries_per_head: 32
+  tau_converge: 0.01
+  tau_decrystallise: 0.05
+  n_stable: 2
+  lambda_dis: 0.01
+  precision_momentum: 0.99
+  use_local_attention_bias: true
+
+  vocab_size: 11
+  embed_scale: true
+
+training:
+  epochs: 20000
+  batch_size: 64
+  learning_rate: 1e-4
+  weight_decay: 1.0
+  betas: [0.9, 0.95]
+  gradient_clip: 1.0
+  scheduler: cosine
+  warmup_steps: 2000
+
+  precision: bfloat16
+  loss_precision: float64
+
+  full_inner_backprop: true
+
+  eval_every: 500
+  pareto_eval_every: 999999
+  quick_eval_samples: 100
+  log_every: 50
+
+  optimizer: adamw
+
+  compile_model: false
+  compile_dynamic: false
+
+  deep_supervision_weighting: "linear"
+
+data:
+  dataset: sudoku_extreme_1k
+  dataset_path: data/sudoku_extreme_1k
+  augmentation_factor: 1000
+  eval_size: 1000
+  num_workers: 4
+  seq_len: 81
+
+wandb:
+  project: "Sudoku-extreme-1k-aug-1000 CORAL-v4"
+  entity: aktuator-ai
+  run_name: v4.2-phase1-n2-18steps-6grad
+  tags: ["v4.2", "phase1", "n2", "partial-grad"]
+  log_every: 50
+  disabled: false
+
+seed: 42
+device: cuda
+experiment_name: phase1_n2_partial_grad

@@ -212,28 +212,42 @@ class CoralCore(nn.Module):
         level_mod = self.levels[level_idx]
         device = z.device
 
-        for t in range(n_steps):
-            # Build backbone input from level state + positional embeddings only
-            backbone_in = level_mod.project_up(z)
+        # Determine no-grad warmup / grad split.
+        # grad_inner_steps=None  → all steps have gradient (default).
+        # grad_inner_steps=k < n_steps → first (n_steps-k) steps are no-grad warmup,
+        #   last k steps are in the computation graph.
+        # grad_inner_steps >= n_steps → all steps have gradient (clamps gracefully).
+        grad_steps_cfg: Optional[int] = getattr(self.config, 'grad_inner_steps', None)
+        if grad_steps_cfg is not None and grad_steps_cfg < n_steps:
+            no_grad_steps = n_steps - grad_steps_cfg
+        else:
+            no_grad_steps = 0
+
+        def _step(z_in: torch.Tensor, t: int) -> torch.Tensor:
+            """Single inner step: project → backbone → project → optional conditioning."""
+            backbone_in = level_mod.project_up(z_in)
             backbone_in = backbone_in + self.level_emb(level_idx, device).unsqueeze(0).unsqueeze(0)
             backbone_in = backbone_in + self.timescale_emb(t).unsqueeze(0).unsqueeze(0)
-
-            # Re-inject the original task input (given digits in Sudoku) so the
-            # backbone always has access to the constraint signal at every step.
             if input_injection is not None:
                 backbone_in = backbone_in + input_injection
-
-            # Run backbone — no conditioning in the backbone input
             z_new = level_mod.project_down(
                 self.backbone(backbone_in, attention_bias=attention_bias)
             )
-
-            # Apply conditioning as a post-backbone residual correction in d_l space.
-            # conditioning must be in d_l space (callers are responsible for this).
             if conditioning is not None:
-                z = z_new + self.cond_gate[level_idx] * (conditioning - z)
-            else:
-                z = z_new
+                return z_new + self.cond_gate[level_idx] * (conditioning - z_in)
+            return z_new
+
+        # Warmup steps: state converges; no activations stored for backward.
+        if no_grad_steps > 0:
+            with torch.no_grad():
+                for t in range(no_grad_steps):
+                    z = _step(z, t)
+
+        # Gradient steps: backprop flows through these only.
+        # z entering here has no grad_fn (produced by no_grad warmup or
+        # initial call site); the grad steps build a fresh computation graph.
+        for t in range(no_grad_steps, n_steps):
+            z = _step(z, t)
 
         return z
 

@@ -70,6 +70,15 @@ class ModelConfig:
     # formula gives T^0=1 step but more steps are desired (e.g. 21 to match TRM).
     inner_steps_override: Optional[int] = None
 
+    # Partial gradient: number of inner steps WITH gradient at the end of each
+    # level's inner loop. The remaining (n_steps - grad_inner_steps) warmup
+    # steps run under torch.no_grad() so activations are not stored.
+    # None = all steps have gradient (default, backward compatible).
+    # e.g. grad_inner_steps=6 with inner_steps_override=18 → 12 no-grad + 6 grad.
+    # Applies to ALL levels; if grad_inner_steps >= level's n_steps, all steps
+    # have gradient (so level 1 with 1 step is always fully in-graph).
+    grad_inner_steps: Optional[int] = None
+
     # Operating mode — controls which forward path is used:
     #   "baseline" : no predictive coding, level-1 only, T inner steps per segment
     #   "pc_only"  : predictive coding with running-statistics precision (v4.1 behaviour)
