@@ -322,14 +322,24 @@ class CoralCore(nn.Module):
 
             if self.effective_mode == "baseline":
                 # ------------------------------------------------------------
-                # Baseline mode: no predictive coding, level 0 only.
-                # Run T inner steps at level 0; ignore all higher levels.
-                # This is the clean no-PC path used for Phase 1 experiments.
+                # Baseline mode: no predictive coding, all levels run bottom-up.
+                # Input is re-injected only at level 0 (the solution level).
+                # Higher levels receive no direct input signal — they learn
+                # global context purely from their own recurrence. This matches
+                # TRM where input_embeddings are injected into z_L (level 0)
+                # but NOT into z_H (level 1+).
+                #
+                # Each level i gets self.level_steps[i] inner steps:
+                #   N=1: level 0 = T^0 = 1 step (or inner_steps_override)
+                #   N=2: level 0 = T^1 = 3 steps, level 1 = T^0 = 1 step
                 # ------------------------------------------------------------
-                z_states[0] = self._run_level(
-                    z_states[0], 0, self.T, conditioning=None, attention_bias=attn_bias,
-                    input_injection=input_signal,
-                )
+                for i in range(self.n_levels):
+                    z_states[i] = self._run_level(
+                        z_states[i], i, self.level_steps[i],
+                        conditioning=None,
+                        attention_bias=attn_bias,
+                        input_injection=input_signal if i == 0 else None,
+                    )
 
             else:
                 # effective_mode == "pc_only" or "full"
