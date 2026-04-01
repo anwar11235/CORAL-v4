@@ -45,23 +45,49 @@ def build_optimizer(
     Args:
         model: The model whose parameters to optimise.
         lr: Learning rate.
-        weight_decay: Weight decay (AdamW style — applied to all non-bias/norm params).
+        weight_decay: Weight decay applied to non-embedding, non-norm matrix weights.
         betas: Adam beta coefficients.
         optimizer_type: "adamw" | "fused_adam_atan2".
 
     Returns:
         Configured optimizer.
+
+    Parameter group rules (matching GPT-2 / LLaMA / TRM practice):
+        decay:    ndim >= 2  AND name does not contain 'emb', 'embedding', or 'norm'
+        no_decay: ndim < 2  (scalars, biases)
+                  OR name contains 'emb' / 'embedding' (token, row, col, level, timescale)
+                  OR name contains 'norm' (RMSNorm, LayerNorm scale vectors)
+
+    Rationale for excluding embeddings: with WD=1.0 over 20k cosine-schedule steps,
+    embeddings decay to ~49% of their natural scale. The empty-cell embedding (token 1)
+    is re-injected at every backbone step as the primary "solve me" signal; decaying it
+    toward zero directly impairs the model's access to task constraints.
     """
-    # Separate decay and no-decay parameters
+    # _NO_DECAY_KEYWORDS: any param whose fully-qualified name (lower-cased) contains
+    # one of these strings goes into the no-decay group regardless of ndim.
+    _NO_DECAY_KEYWORDS = ("emb", "embedding", "norm")
+
     decay_params = []
     no_decay_params = []
+    decay_numel = 0
+    no_decay_numel = 0
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim <= 1 or name.endswith(".bias"):
+        name_lower = name.lower()
+        if param.ndim < 2 or any(kw in name_lower for kw in _NO_DECAY_KEYWORDS):
             no_decay_params.append(param)
+            no_decay_numel += param.numel()
         else:
             decay_params.append(param)
+            decay_numel += param.numel()
+
+    log.info(
+        f"Optimizer param split — "
+        f"Decay: {len(decay_params)} tensors ({decay_numel / 1e6:.2f}M params, WD={weight_decay}), "
+        f"No-decay: {len(no_decay_params)} tensors ({no_decay_numel / 1e6:.2f}M params, WD=0.0)"
+    )
 
     param_groups = [
         {"params": decay_params, "weight_decay": weight_decay},
