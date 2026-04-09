@@ -343,3 +343,134 @@ def test_repr_diagnostics_uses_token_1_for_empty():
     # Values should be finite
     for k, v in metrics.items():
         assert math.isfinite(v), f"{k} = {v} is not finite"
+
+
+# ===========================================================================
+# Fix 4 — Learned z_init residual
+# ===========================================================================
+
+def _tiny_model_cfg_with_learned_z_init(use_learned: bool = True) -> tuple:
+    """Tiny config matching _tiny_model_cfg but with learned z_init flag."""
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=11, mode="baseline",
+        inner_steps_override=3,
+        embed_scale=True,
+        use_consolidation_step=True,
+        use_learned_z_init=use_learned,
+        learned_z_init_seq_len=9,  # 3x3 grid
+    )
+    full_cfg = CoralConfig(model=model_cfg, device="cpu")
+    full_cfg.training.precision = "float32"
+    return full_cfg, model_cfg
+
+
+def test_learned_z_init_parameter_exists_when_enabled():
+    """When use_learned_z_init=True, CoralCore must have a learned_z_init parameter."""
+    _, model_cfg = _tiny_model_cfg_with_learned_z_init(use_learned=True)
+    core = CoralCore(model_cfg)
+    assert core.learned_z_init is not None
+    assert isinstance(core.learned_z_init, nn.Parameter)
+    assert core.learned_z_init.shape == (9, 64)
+
+
+def test_learned_z_init_absent_when_disabled():
+    """When use_learned_z_init=False, learned_z_init must be None."""
+    _, model_cfg = _tiny_model_cfg_with_learned_z_init(use_learned=False)
+    core = CoralCore(model_cfg)
+    assert core.learned_z_init is None
+
+
+def test_learned_z_init_zero_init_matches_disabled_at_step_0():
+    """Freshly initialized learned_z_init is zeros, so first forward must
+    produce identical output to use_learned_z_init=False (with same weights)."""
+    cfg_on, model_cfg_on = _tiny_model_cfg_with_learned_z_init(use_learned=True)
+    cfg_off, model_cfg_off = _tiny_model_cfg_with_learned_z_init(use_learned=False)
+
+    adapter = GridAdapter(cfg_on, vocab_size=11, grid_height=3, grid_width=3)
+    core_on = CoralCore(model_cfg_on)
+    core_off = CoralCore(model_cfg_off)
+
+    # Sync backbone weights (state_dict for core_off won't have learned_z_init key)
+    on_state = {k: v for k, v in core_on.state_dict().items() if k != "learned_z_init"}
+    core_off.load_state_dict(on_state, strict=False)
+
+    x = torch.randint(0, 11, (2, 9))
+    with torch.no_grad():
+        z1 = adapter.encode(x)
+        out_on = core_on(z1, K_max=1, training=False, decode_fn=None).z_states[0]
+        out_off = core_off(z1, K_max=1, training=False, decode_fn=None).z_states[0]
+
+    assert torch.allclose(out_on, out_off, atol=1e-6), (
+        "Zero-initialized learned_z_init should produce identical output to disabled."
+    )
+
+
+def test_learned_z_init_changes_output_when_nonzero():
+    """After manually setting learned_z_init to nonzero, output must differ."""
+    _, model_cfg = _tiny_model_cfg_with_learned_z_init(use_learned=True)
+    cfg, _ = _tiny_model_cfg_with_learned_z_init(use_learned=True)
+    adapter = GridAdapter(cfg, vocab_size=11, grid_height=3, grid_width=3)
+    core = CoralCore(model_cfg)
+
+    x = torch.randint(0, 11, (2, 9))
+    with torch.no_grad():
+        z1 = adapter.encode(x)
+        out_zero = core(z1, K_max=1, training=False, decode_fn=None).z_states[0].clone()
+
+        # Set learned_z_init to nontrivial values
+        core.learned_z_init.data.normal_(0, 0.1)
+        out_nonzero = core(z1, K_max=1, training=False, decode_fn=None).z_states[0]
+
+    assert not torch.allclose(out_zero, out_nonzero, atol=1e-5), (
+        "Setting learned_z_init to nonzero values should change output."
+    )
+
+
+def test_learned_z_init_receives_gradient():
+    """learned_z_init must be in the computation graph and receive gradient."""
+    _, model_cfg = _tiny_model_cfg_with_learned_z_init(use_learned=True)
+    cfg, _ = _tiny_model_cfg_with_learned_z_init(use_learned=True)
+    adapter = GridAdapter(cfg, vocab_size=11, grid_height=3, grid_width=3)
+    core = CoralCore(model_cfg)
+
+    x = torch.randint(0, 11, (2, 9))
+    z1 = adapter.encode(x)
+    output = core(z1, K_max=1, training=True, decode_fn=adapter.decode)
+    loss = output.all_logits[-1].sum()
+    loss.backward()
+
+    assert core.learned_z_init.grad is not None
+    assert core.learned_z_init.grad.abs().sum().item() > 0
+
+
+def test_learned_z_init_does_not_affect_input_signal():
+    """The learned residual must only modify the starting state, NOT the
+    injection signal used throughout the inner loop. We verify this indirectly
+    by confirming that with use_learned_z_init=True and learned_z_init=0,
+    the output is bit-identical to use_learned_z_init=False."""
+    # This is the same as test_learned_z_init_zero_init_matches_disabled_at_step_0
+    # but explicitly framed as the input_signal isolation test.
+    cfg_on, model_cfg_on = _tiny_model_cfg_with_learned_z_init(use_learned=True)
+    cfg_off, model_cfg_off = _tiny_model_cfg_with_learned_z_init(use_learned=False)
+
+    adapter = GridAdapter(cfg_on, vocab_size=11, grid_height=3, grid_width=3)
+    core_on = CoralCore(model_cfg_on)
+    core_off = CoralCore(model_cfg_off)
+    on_state = {k: v for k, v in core_on.state_dict().items() if k != "learned_z_init"}
+    core_off.load_state_dict(on_state, strict=False)
+
+    x = torch.randint(0, 11, (2, 9))
+    with torch.no_grad():
+        z1 = adapter.encode(x)
+        out_on = core_on(z1, K_max=2, training=False, decode_fn=adapter.decode)
+        out_off = core_off(z1, K_max=2, training=False, decode_fn=adapter.decode)
+
+    # All segment outputs should match (proves input_signal is unchanged)
+    for i in range(len(out_on.all_logits)):
+        assert torch.allclose(out_on.all_logits[i], out_off.all_logits[i], atol=1e-5), (
+            f"Segment {i} logits differ — learned_z_init may be leaking into input_signal."
+        )

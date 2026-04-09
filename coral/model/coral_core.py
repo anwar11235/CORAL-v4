@@ -167,6 +167,16 @@ class CoralCore(nn.Module):
             for i in range(1, config.n_levels)
         ])
 
+        # Learned residual on top of z1_init. Initialized to zeros so the first forward
+        # pass behaves identically to use_learned_z_init=False; the model learns a
+        # non-trivial starting state through training.
+        if getattr(config, "use_learned_z_init", False):
+            self.learned_z_init = nn.Parameter(
+                torch.zeros(config.learned_z_init_seq_len, config.backbone_dim)
+            )
+        else:
+            self.learned_z_init = None
+
     def _run_level(
         self,
         z: torch.Tensor,
@@ -320,10 +330,19 @@ class CoralCore(nn.Module):
                 + self.backbone.box_bias * box_mask.to(device)
             )
 
+        # Apply learned per-position residual if enabled. Broadcast over batch dim.
+        if self.learned_z_init is not None:
+            assert self.learned_z_init.shape[0] == L, (
+                f"learned_z_init seq_len {self.learned_z_init.shape[0]} != input L {L}"
+            )
+            z1_start = z1_init + self.learned_z_init.unsqueeze(0)  # [B, L, d] + [1, L, d]
+        else:
+            z1_start = z1_init
+
         # Initialise level states. Higher levels are seeded from the level
         # below via z_init_proj so the prediction network has a non-trivial
         # starting point from segment 0 instead of dead zeros.
-        z_states = [z1_init]
+        z_states = [z1_start]
         for i in range(1, self.n_levels):
             z_init = self.z_init_proj[i - 1](z_states[i - 1])
             z_states.append(z_init)

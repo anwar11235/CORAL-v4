@@ -92,6 +92,15 @@ class ModelConfig:
     embed_scale: bool = True  # scale input embeddings by sqrt(d_model) AFTER layer norm (effective since fix)
     use_consolidation_step: bool = True  # add one no-injection backbone pass at end of each inner loop
 
+    # Learned per-position residual added to z1_init at the start of forward.
+    # Gives the model a learnable starting reasoning state on top of the adapter output.
+    # When True, CoralCore allocates an nn.Parameter of shape [seq_len, backbone_dim]
+    # initialized to zeros (so the initial behavior matches use_learned_z_init=False).
+    use_learned_z_init: bool = False
+    # Sequence length used to size the learned z_init parameter. Must match the
+    # adapter's seq_len (81 for Sudoku). Read at CoralCore construction time.
+    learned_z_init_seq_len: int = 81
+
 
 @dataclass
 class TrainingConfig:
