@@ -223,12 +223,29 @@ class CoralCore(nn.Module):
         else:
             no_grad_steps = 0
 
-        def _step(z_in: torch.Tensor, t: int) -> torch.Tensor:
-            """Single inner step: project → backbone → project → optional conditioning."""
+        # Whether to add a consolidation step (one no-injection backbone pass after the
+        # main injection loop).  Mirrors TRM's pattern: L_cycles steps with injection,
+        # then one step without, allowing the state to integrate input information through
+        # pure recurrent processing without the input pulling it toward its own attractor.
+        # Only meaningful when input_injection is provided (no-op otherwise).
+        use_consolidation = (
+            getattr(self.config, "use_consolidation_step", True)
+            and input_injection is not None
+        )
+
+        def _step(z_in: torch.Tensor, t: int, inject: bool = True) -> torch.Tensor:
+            """Single inner step: project → backbone → project → optional conditioning.
+
+            Args:
+                z_in:   Current level state.
+                t:      Timescale embedding index for this step.
+                inject: Whether to add input_injection to the backbone input.
+                        Set False for the consolidation step.
+            """
             backbone_in = level_mod.project_up(z_in)
             backbone_in = backbone_in + self.level_emb(level_idx, device).unsqueeze(0).unsqueeze(0)
             backbone_in = backbone_in + self.timescale_emb(t).unsqueeze(0).unsqueeze(0)
-            if input_injection is not None:
+            if inject and input_injection is not None:
                 backbone_in = backbone_in + input_injection
             z_new = level_mod.project_down(
                 self.backbone(backbone_in, attention_bias=attention_bias)
@@ -248,6 +265,13 @@ class CoralCore(nn.Module):
         # initial call site); the grad steps build a fresh computation graph.
         for t in range(no_grad_steps, n_steps):
             z = _step(z, t)
+
+        # Consolidation step: one backbone pass with NO input_injection, always in-graph.
+        # Uses timescale index n_steps (one beyond the last injection step) so the
+        # backbone can distinguish "consolidation" from the regular inner steps.
+        # The +4 buffer in TimescaleEmbedding's max_steps ensures this index is valid.
+        if use_consolidation:
+            z = _step(z, n_steps, inject=False)
 
         return z
 

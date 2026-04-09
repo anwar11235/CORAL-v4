@@ -99,9 +99,10 @@ class GridAdapter(BaseAdapter):
         pos = (row + col).unsqueeze(0)        # [1, L, d_model]
 
         emb = tok + pos
+        emb = self.input_norm(emb)
         if self.embed_scale:
             emb = emb * math.sqrt(self.d_model)
-        return self.input_norm(emb)
+        return emb
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """Decode d_model embeddings to per-cell token logits.

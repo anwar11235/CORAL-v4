@@ -299,7 +299,7 @@ class TrainerV4:
 
                 # z_states[0] = level-0 state after the final segment
                 z_final = output.z_states[0].float().cpu()   # [B, L, d]
-                empty_mask = (inputs == 0).cpu()             # [B, L]
+                empty_mask = (inputs == 1).cpu()             # [B, L] — empty cells are token 1
                 labels_cpu = labels.cpu()                    # [B, L]
 
                 all_states.append(z_final)

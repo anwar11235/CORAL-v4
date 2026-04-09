@@ -89,7 +89,8 @@ class ModelConfig:
 
     # Adapter
     vocab_size: int = 11  # Sudoku: PAD=0, digits 1-10
-    embed_scale: bool = True  # scale input embeddings by sqrt(d_model) before layer norm
+    embed_scale: bool = True  # scale input embeddings by sqrt(d_model) AFTER layer norm (effective since fix)
+    use_consolidation_step: bool = True  # add one no-injection backbone pass at end of each inner loop
 
 
 @dataclass
