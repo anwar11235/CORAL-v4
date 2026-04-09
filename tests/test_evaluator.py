@@ -181,3 +181,88 @@ def test_evaluate_accuracy_with_attention_bias():
 
     # Just verify it runs without error and returns valid values
     assert 0.0 <= metrics["eval/token_accuracy"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Difficulty-bucketed accuracy
+# ---------------------------------------------------------------------------
+
+def _make_bucketed_loader(bucket_counts: dict) -> DataLoader:
+    """Build a 9×9 (81-cell) DataLoader with puzzles in specified difficulty buckets.
+
+    Args:
+        bucket_counts: dict mapping bucket name to (n_empty, n_puzzles) pairs.
+            bucket names: "0_29", "30_49", "50_59", "60_plus"
+            n_empty: number of cells set to 1 (empty) in that puzzle
+            n_puzzles: number of puzzles to create for that bucket
+
+    Returns a DataLoader with batch_size = total puzzles.
+    """
+    L = 81
+    EMPTY_EMPTY_COUNTS = {"0_29": 20, "30_49": 40, "50_59": 55, "60_plus": 65}
+    inputs_list = []
+    labels_list = []
+    for bucket, n_puzzles in bucket_counts.items():
+        n_empty = EMPTY_EMPTY_COUNTS[bucket]
+        for _ in range(n_puzzles):
+            inp = torch.full((L,), 2, dtype=torch.long)   # non-empty cells = token 2
+            inp[:n_empty] = 1                              # first n_empty cells are empty (token 1)
+            lbl = torch.randint(1, 10, (L,))
+            inputs_list.append(inp)
+            labels_list.append(lbl)
+
+    inputs_t = torch.stack(inputs_list)
+    labels_t = torch.stack(labels_list)
+    total = inputs_t.shape[0]
+
+    class _DD(torch.utils.data.Dataset):
+        def __getitem__(self, i):
+            return {"inputs": inputs_t[i], "labels": labels_t[i]}
+        def __len__(self):
+            return total
+
+    return DataLoader(_DD(), batch_size=total)
+
+
+def test_bucket_counts_sum_to_total():
+    """Bucket counts must sum to the total number of evaluated puzzles."""
+    full_cfg, model_cfg = _make_config()
+    # Use a 9×9 adapter so inputs have 81 cells (enables 30-49 / 50-59 / 60+ buckets)
+    adapter = GridAdapter(full_cfg, vocab_size=10, grid_height=9, grid_width=9)
+    core = CoralCore(model_cfg)
+
+    bucket_counts = {"0_29": 2, "30_49": 3, "50_59": 2, "60_plus": 1}
+    loader = _make_bucketed_loader(bucket_counts)
+
+    metrics = evaluate_accuracy(adapter, core, loader, device=torch.device("cpu"), dtype=torch.float32)
+
+    total = sum(bucket_counts.values())
+    bucket_total = sum(
+        int(metrics[f"eval/bucket_{k}_count"])
+        for k in ("0_29", "30_49", "50_59", "60_plus")
+    )
+    assert bucket_total == total, (
+        f"Bucket counts sum to {bucket_total}, expected {total}. "
+        f"Counts: { {k: metrics[f'eval/bucket_{k}_count'] for k in ('0_29','30_49','50_59','60_plus')} }"
+    )
+    # Also verify individual bucket counts match expectations
+    for k, expected_n in bucket_counts.items():
+        assert metrics[f"eval/bucket_{k}_count"] == expected_n
+
+
+def test_bucket_accuracies_in_range():
+    """All per-bucket accuracy values must be in [0, 1]."""
+    full_cfg, model_cfg = _make_config()
+    adapter = GridAdapter(full_cfg, vocab_size=10, grid_height=9, grid_width=9)
+    core = CoralCore(model_cfg)
+
+    bucket_counts = {"0_29": 2, "30_49": 2, "50_59": 2, "60_plus": 2}
+    loader = _make_bucketed_loader(bucket_counts)
+
+    metrics = evaluate_accuracy(adapter, core, loader, device=torch.device("cpu"), dtype=torch.float32)
+
+    for k in ("0_29", "30_49", "50_59", "60_plus"):
+        for suffix in ("token_acc", "empty_acc", "exact_acc"):
+            key = f"eval/bucket_{k}_{suffix}"
+            val = metrics[key]
+            assert 0.0 <= val <= 1.0, f"{key} = {val} is out of [0, 1]"
