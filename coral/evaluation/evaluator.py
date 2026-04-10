@@ -40,6 +40,7 @@ def evaluate_accuracy(
     K_override: Optional[int] = None,
     max_puzzles: Optional[int] = None,
     dataset_name: str = "sudoku_extreme_1k",
+    collect_diagnostics: bool = True,
 ) -> Dict[str, float]:
     """Evaluate exact and token accuracy on a full evaluation dataset.
 
@@ -106,8 +107,14 @@ def evaluate_accuracy(
 
     K_max = K_override if K_override is not None else core.config.K_max
 
-    # Per-segment accumulators (maze only, full-depth eval only).
-    collect_maze_diag = (dataset_name == "maze_30x30_hard") and (K_override is None)
+    # Per-segment / velocity / repr diagnostics are enabled only for full-depth
+    # quick eval (K_override=None, collect_diagnostics=True). Pareto eval passes
+    # collect_diagnostics=False to avoid the overhead across all K values.
+    collect_maze_diag = (
+        (dataset_name == "maze_30x30_hard")
+        and (K_override is None)
+        and collect_diagnostics
+    )
     if collect_maze_diag:
         if K_max <= 5:
             seg_checkpoints = list(range(K_max))
@@ -270,8 +277,8 @@ def evaluate_accuracy(
         )
         metrics[f"eval/bucket_{key}_exact_acc"] = acc["exact_correct"] / n if n > 0 else 0.0
 
-    # Repr diagnostics for Sudoku (empty cells) — full-depth eval only.
-    if K_override is None:
+    # Repr diagnostics for Sudoku (empty cells) — full-depth quick eval only.
+    if K_override is None and collect_diagnostics:
         repr_max = 64 if max_puzzles is None else min(max_puzzles, 64)
         repr_m = compute_repr_diagnostics(
             adapter=adapter, core=core, dataloader=dataloader,

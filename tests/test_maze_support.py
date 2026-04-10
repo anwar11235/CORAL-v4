@@ -517,3 +517,107 @@ def test_repr_diagnostics_maze():
     assert "repr/state_norm_std" in metrics
     for k, v in metrics.items():
         assert math.isfinite(v), f"{k} = {v} is not finite"
+
+
+# ---------------------------------------------------------------------------
+# Test 13: evaluate_pareto respects max_puzzles
+# ---------------------------------------------------------------------------
+
+def test_evaluate_pareto_respects_max_puzzles():
+    """evaluate_pareto should stop at max_puzzles samples."""
+    import time
+    from coral.evaluation.pareto import evaluate_pareto
+    from torch.utils.data import DataLoader, Dataset
+
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=6, mode="baseline",
+        inner_steps_override=2,
+        use_local_attention_bias=False,
+    )
+    cfg = CoralConfig(model=model_cfg, device="cpu")
+
+    adapter = GridAdapter(cfg, vocab_size=6, grid_height=10, grid_width=10)
+    core = CoralCore(model_cfg)
+
+    class TinyMaze(Dataset):
+        def __len__(self): return 100  # intentionally larger than max_puzzles
+        def __getitem__(self, i):
+            inp = torch.randint(1, 5, (100,), dtype=torch.long)
+            lbl = inp.clone()
+            lbl[::10] = 5
+            return {"inputs": inp, "labels": lbl}
+
+    loader = DataLoader(TinyMaze(), batch_size=4)
+
+    t0 = time.time()
+    metrics = evaluate_pareto(
+        adapter=adapter, core=core, dataloader=loader,
+        device=torch.device("cpu"), dtype=torch.float32,
+        max_puzzles=8,
+        dataset_name="maze_30x30_hard",
+    )
+    elapsed = time.time() - t0
+
+    assert "eval/pareto_area_path_accuracy" in metrics
+    # With max_puzzles=8 on a 100-puzzle dataset, should terminate quickly
+    assert elapsed < 30, f"evaluate_pareto took {elapsed:.1f}s on 8 puzzles (max_puzzles not respected?)"
+
+
+# ---------------------------------------------------------------------------
+# Test 14: evaluate_pareto does NOT collect inner-step states
+# ---------------------------------------------------------------------------
+
+def test_evaluate_pareto_does_not_collect_inner_states():
+    """evaluate_pareto must not pass collect_inner_step_states=True to core.forward."""
+    from coral.evaluation.pareto import evaluate_pareto
+    from torch.utils.data import DataLoader, Dataset
+
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=6, mode="baseline",
+        inner_steps_override=2,
+        use_local_attention_bias=False,
+    )
+    cfg = CoralConfig(model=model_cfg, device="cpu")
+
+    adapter = GridAdapter(cfg, vocab_size=6, grid_height=10, grid_width=10)
+    core = CoralCore(model_cfg)
+
+    # Spy on forward calls
+    original_forward = core.forward
+    forward_calls = []
+
+    def spy_forward(*args, **kwargs):
+        forward_calls.append(kwargs.get("collect_inner_step_states", False))
+        return original_forward(*args, **kwargs)
+
+    core.forward = spy_forward
+
+    class TinyMaze(Dataset):
+        def __len__(self): return 4
+        def __getitem__(self, i):
+            inp = torch.randint(1, 5, (100,), dtype=torch.long)
+            lbl = inp.clone()
+            lbl[::10] = 5
+            return {"inputs": inp, "labels": lbl}
+
+    loader = DataLoader(TinyMaze(), batch_size=2)
+    _ = evaluate_pareto(
+        adapter=adapter, core=core, dataloader=loader,
+        device=torch.device("cpu"), dtype=torch.float32,
+        max_puzzles=4,
+        dataset_name="maze_30x30_hard",
+    )
+
+    assert len(forward_calls) > 0, "evaluate_pareto made no forward calls"
+    assert not any(forward_calls), (
+        f"evaluate_pareto set collect_inner_step_states=True in "
+        f"{sum(forward_calls)}/{len(forward_calls)} calls"
+    )

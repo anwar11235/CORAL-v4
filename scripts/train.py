@@ -99,10 +99,11 @@ def main(cfg: DictConfig) -> None:
         seed=config.seed,
         epochs_per_iter=1,
     )
+    eval_batch_size = getattr(config.training, "eval_batch_size", config.training.batch_size)
     eval_loader, _ = create_sudoku_dataloader(
         dataset_path=config.data.dataset_path,
         split="test",
-        global_batch_size=config.training.batch_size,
+        global_batch_size=eval_batch_size,
         seed=config.seed,
         test_set_mode=True,
     )
@@ -232,6 +233,7 @@ def main(cfg: DictConfig) -> None:
                     dataloader=eval_loader,
                     device=device,
                     dtype=torch.bfloat16,
+                    max_puzzles=getattr(config.training, "pareto_eval_samples", 100),
                     dataset_name=config.data.dataset,
                 )
                 _log_precision_metrics(trainer, eval_loader, device, pareto_results)

@@ -124,6 +124,12 @@ class TrainingConfig:
     eval_every: int = 500          # quick eval frequency (steps)
     pareto_eval_every: int = 5000  # full Pareto eval frequency (steps)
     quick_eval_samples: int = 100  # puzzles used for quick eval
+    # Pareto eval runs 5 forward passes per batch, so its per-sample cost is ~5x
+    # quick eval. A smaller sample count keeps each Pareto checkpoint fast.
+    pareto_eval_samples: int = 100
+    # Eval has no backward pass, so a larger batch fits easily in GPU memory.
+    # Using a bigger eval batch reduces iteration overhead vs training batch size.
+    eval_batch_size: int = 32
     log_every: int = 50
 
     # Optimizer selection

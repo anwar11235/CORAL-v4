@@ -28,7 +28,9 @@ model:
   mode: "baseline"
 
 training:
-  batch_size: 8                      # halved vs smoke (K_max=16 x 18 steps eats memory)
+  batch_size: 4                      # confirmed at smoke test (8 OOMed at K_max=16)
+  eval_batch_size: 32                # eval has no backward pass; larger batch = faster eval
+  pareto_eval_samples: 100           # 100 puzzles × 5 K-values; should complete in ~15-30s
   learning_rate: 7e-5
   weight_decay: 1.0
   epochs: 3000

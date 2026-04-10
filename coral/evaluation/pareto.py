@@ -28,6 +28,7 @@ def evaluate_pareto(
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
     K_values: Optional[List[int]] = None,
+    max_puzzles: int = 100,
     dataset_name: str = "sudoku_extreme_1k",
 ) -> Dict[str, float]:
     """Evaluate accuracy at multiple forced depth limits.
@@ -39,6 +40,9 @@ def evaluate_pareto(
         device:       Compute device.
         dtype:        Forward pass dtype.
         K_values:     List of segment limits to evaluate at.
+        max_puzzles:  Maximum puzzles to process per K value and for the
+                      full-depth eval. Limits wall-clock cost since Pareto
+                      runs ~(len(K_values)+1) forward passes per batch.
         dataset_name: Dataset identifier — controls which per-K metrics are emitted.
                       "maze_30x30_hard" → emits pareto_k{K}_path/wall/non_path/exact/token.
                       Anything else → emits accuracy@K{K} (Sudoku default).
@@ -63,7 +67,9 @@ def evaluate_pareto(
     results: Dict[str, float] = {}
     valid_Ks: List[int] = []
 
-    # Evaluate at each forced depth.
+    # Evaluate at each forced depth. collect_inner_step_states is NOT passed —
+    # it defaults to False inside core.forward. Inner-step state collection is
+    # only for the quick-eval maze branch, not Pareto eval.
     for K in sorted(K_values):
         if K > core.config.K_max:
             log.warning(
@@ -73,7 +79,8 @@ def evaluate_pareto(
         valid_Ks.append(K)
         metrics = evaluate_accuracy(
             adapter, core, dataloader, device, dtype,
-            K_override=K, dataset_name=dataset_name,
+            K_override=K, max_puzzles=max_puzzles, dataset_name=dataset_name,
+            collect_diagnostics=False,
         )
         if dataset_name == "maze_30x30_hard":
             results[f"eval/pareto_k{K}_path_accuracy"] = metrics.get("eval/path_accuracy", 0.0)
@@ -85,9 +92,12 @@ def evaluate_pareto(
             results[f"eval/accuracy@K{K}"] = metrics["eval/exact_accuracy"]
 
     # Full-depth evaluation (adaptive halting, K_override=None).
+    # collect_diagnostics=False: per-segment states, velocity, and repr are for
+    # quick eval only; Pareto callers get accuracy metrics without that overhead.
     full_metrics = evaluate_accuracy(
         adapter, core, dataloader, device, dtype,
-        K_override=None, dataset_name=dataset_name,
+        K_override=None, max_puzzles=max_puzzles, dataset_name=dataset_name,
+        collect_diagnostics=False,
     )
     results["eval/exact_accuracy"] = full_metrics["eval/exact_accuracy"]
     results["eval/token_accuracy"] = full_metrics["eval/token_accuracy"]
