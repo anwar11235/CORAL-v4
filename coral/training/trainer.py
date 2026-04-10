@@ -207,6 +207,21 @@ class TrainerV4:
             "eval/avg_halting_step": float(output.num_segments),
         }
 
+        # Maze-specific metrics (gated on dataset name)
+        if getattr(self.config.data, "dataset", "") == "maze_30x30_hard":
+            # path_accuracy: accuracy on optimal-path cells (label == 5)
+            path_mask = labels == 5
+            if path_mask.sum() > 0:
+                metrics["eval/path_accuracy"] = (
+                    ((preds == labels) & path_mask).sum().float() / path_mask.sum().float()
+                ).item()
+            # wall_accuracy: accuracy on wall cells (label == 2)
+            wall_mask = labels == 2
+            if wall_mask.sum() > 0:
+                metrics["eval/wall_accuracy"] = (
+                    ((preds == labels) & wall_mask).sum().float() / wall_mask.sum().float()
+                ).item()
+
         # ---- Crystallisation diagnostics (mode="full" only) ----
         use_crys = (
             self.config.model.use_crystallisation
@@ -269,6 +284,11 @@ class TrainerV4:
         Returns:
             Dict of repr/* metrics (empty if not enough data).
         """
+        # Sudoku-specific: "empty cells" (token==1) have no equivalent in maze.
+        # Skip entirely for non-Sudoku datasets.
+        if getattr(self.config.data, "dataset", "sudoku_extreme_1k") != "sudoku_extreme_1k":
+            return {}
+
         self.adapter.eval()
         self.core.eval()
 

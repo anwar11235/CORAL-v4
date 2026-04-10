@@ -156,10 +156,17 @@ class GridAdapter(BaseAdapter):
         col = self.col_indices  # [L]
 
         # Box index: (row // box_h) * n_box_cols + (col // box_w)
-        box_h = self.grid_height // 3
-        box_w = self.grid_width // 3
-        n_box_cols = self.grid_width // box_w
-        box_idx = (row // box_h) * n_box_cols + (col // box_w)  # [L]
+        # Designed for grids where height and width are divisible by 3.
+        # For non-divisible grids, fall back to row-only grouping for the box mask
+        # (same_box will equal same_row in that case).
+        if self.grid_height % 3 == 0 and self.grid_width % 3 == 0:
+            box_h = self.grid_height // 3
+            box_w = self.grid_width // 3
+            n_box_cols = self.grid_width // box_w
+            box_idx = (row // box_h) * n_box_cols + (col // box_w)  # [L]
+        else:
+            # No sub-box structure: treat each row as its own "box"
+            box_idx = row  # [L]
 
         same_row = (row.unsqueeze(1) == row.unsqueeze(0)).float().to(device)  # [L, L]
         same_col = (col.unsqueeze(1) == col.unsqueeze(0)).float().to(device)  # [L, L]

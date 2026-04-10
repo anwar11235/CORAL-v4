@@ -435,6 +435,56 @@ in `TrainerV4.__init__` and passing them to every `core.forward()` call.
 - `level_steps[0] = 21`, `K_max = 16` → 21 × 16 = **336 backbone applications per forward pass**.
 - Equivalent to a 672-layer effective depth (2 transformer layers per backbone call).
 
+### Session 12 — Maze-Hard Support (2026-04-09)
+
+**What was done:**
+Minimum necessary to run CORAL on Maze-Hard 30×30. No new features — data loading,
+generalised grid adapter, new config, and maze-specific eval metrics.
+
+1. **`coral/config.py`** — Added `grid_height: int = 9` and `grid_width: int = 9` to
+   `DataConfig`. Defaults preserve full backward compatibility with all Sudoku configs.
+
+2. **`coral/adapters/grid.py`** — Added guard in `build_attention_masks` for grids where
+   height or width is not divisible by 3. Falls back to row-index as the box index
+   (safe no-op for maze since `use_local_attention_bias=False`). 30×30 is divisible by 3
+   so it produces correct 10×10 box masks if ever called.
+
+3. **`scripts/train.py`** — `GridAdapter` instantiation now reads `config.data.grid_height`
+   and `config.data.grid_width` instead of hardcoding `9, 9`.
+
+4. **`coral/training/trainer.py`** — Two changes:
+   - `eval_step`: computes `eval/path_accuracy` (cells where `labels==5`) and
+     `eval/wall_accuracy` (cells where `labels==2`) when
+     `config.data.dataset == "maze_30x30_hard"`. Both are gated — Sudoku runs unaffected.
+   - `compute_repr_diagnostics`: returns `{}` immediately for non-Sudoku datasets.
+     Sudoku-specific "empty cells" notion (`inputs==1`) has no maze equivalent.
+
+5. **`configs/phase1_maze_baseline.yaml`** — New config:
+   - `vocab_size=6` (pad=0, path=1, wall=2, start=3, goal=4, optimal_path=5)
+   - `seq_len=900`, `grid_height=30`, `grid_width=30`
+   - `use_local_attention_bias=false` (no row/col/box structure in maze)
+   - `K_max=4`, `inner_steps_override=6` (small for Session A smoke test)
+   - `batch_size=16` (900-len sequences are 11× longer than Sudoku)
+   - `deep_supervision_weighting: "uniform"`, `use_consolidation_step: false`
+
+6. **`tests/test_maze_support.py`** — 4 new tests (all pass):
+   - `test_grid_adapter_30x30`: encode [2, 900] → [2, 900, 512], no crashes
+   - `test_grid_adapter_decode_30x30`: decode [2, 900, 512] → [2, 900, 6]
+   - `test_maze_config_loads`: YAML loads → `seq_len==900`, `vocab_size==6`
+   - `test_coral_core_forward_maze_shapes`: forward [2, 900, 512] → [2, 900, 512]
+
+**Test status:** 223/223 pass.
+
+**Maze dataset format:** Same HRM-format numpy arrays as Sudoku
+(`all__inputs.npy`, `all__labels.npy`, etc.). The existing `SudokuDataset` loader
+works unchanged — point `dataset_path` at the maze directory.
+
+**Primary maze metric:** `eval/exact_accuracy` — all 900 cells must match labels.
+Secondary: `eval/path_accuracy` (label==5 cells), `eval/wall_accuracy` (label==2 cells).
+
+**Session B TODO:** Scale up `inner_steps_override` and `K_max`, enable maze-specific
+repr diagnostics, run full training run on Vast.ai.
+
 ---
 
 ## Repository Layout
@@ -456,7 +506,7 @@ coral-v4/
 │   │   ├── halting.py                 # Q-learning adaptive halting
 │   │   └── coral_core.py              # Main assembly: 3 modes (baseline, pc_only, full)
 │   ├── adapters/
-│   │   └── grid.py                    # Sudoku encoder/decoder + attention bias masks
+│   │   └── grid.py                    # Grid encoder/decoder (Sudoku + Maze) + attention bias masks
 │   ├── training/
 │   │   ├── losses.py                  # Stablemax CE + prediction loss + commitment + disentanglement
 │   │   ├── annealing.py               # get_effective_lambda_amort (linear ramp schedule)
@@ -470,6 +520,7 @@ coral-v4/
 │
 ├── configs/                           # Hydra YAML configs (one per experiment phase)
 │   ├── phase1_baseline_no_pc.yaml
+│   ├── phase1_maze_baseline.yaml      # Maze-Hard 30x30 baseline (Session A smoke test)
 │   ├── phase3a_crystal_simple.yaml
 │   ├── phase3b_crystal_multihead.yaml
 │   ├── phase3c_crystal_decrystal.yaml
@@ -484,7 +535,7 @@ coral-v4/
 │   ├── diagnostic_precision.py        # Legacy: precision diagnostic (1000 steps)
 │   └── diagnostic_no_pc.py            # Legacy: no-PC baseline diagnostic
 │
-├── tests/                             # pytest test suite (140 tests, all pass)
+├── tests/                             # pytest test suite (223 tests, all pass)
 │   ├── test_backbone.py               # backbone shape, gradient, attention bias
 │   ├── test_predictive_coding.py      # RunningPrecision, PC module, loss
 │   ├── test_crystallisation.py        # codebook, convergence, decrystallisation, manager
@@ -496,12 +547,16 @@ coral-v4/
 │   ├── test_baseline_mode.py          # session 1 baseline mode tests
 │   ├── test_adapters.py               # grid adapter encode/decode
 │   ├── test_configs.py                # YAML config loading + annealing
-│   └── test_diagnostics.py            # repr diagnostics + codebook analysis
+│   ├── test_diagnostics.py            # repr diagnostics + codebook analysis
+│   └── test_maze_support.py           # Maze-Hard 30x30 adapter, config, core forward
 │
 └── data/                              # Data files (gitignored)
-    └── sudoku_extreme_1k/
-        ├── train/all__inputs.npy, all__labels.npy
-        └── test/all__inputs.npy, all__labels.npy
+    ├── sudoku_extreme_1k/
+    │   ├── train/all__inputs.npy, all__labels.npy
+    │   └── test/all__inputs.npy, all__labels.npy
+    └── maze-30x30-hard-1k/            # Generated by TRM build_maze_dataset.py
+        ├── train/all__inputs.npy, all__labels.npy, ...
+        └── test/all__inputs.npy, all__labels.npy, ...
 ```
 
 ---

@@ -111,8 +111,8 @@ def main(cfg: DictConfig) -> None:
     log.info("Building model...")
     adapter = GridAdapter(
         config,
-        grid_height=9,
-        grid_width=9,
+        grid_height=config.data.grid_height,
+        grid_width=config.data.grid_width,
     )
     core = CoralCore(config.model)
     loss_fn = CoralLoss(config.model)

@@ -157,6 +157,8 @@ class DataConfig:
     eval_size: int = 1000
     num_workers: int = 1
     seq_len: int = 81  # 9x9 Sudoku
+    grid_height: int = 9  # number of grid rows (9 for Sudoku, 30 for Maze-30x30)
+    grid_width: int = 9   # number of grid columns (9 for Sudoku, 30 for Maze-30x30)
 
 
 @dataclass
