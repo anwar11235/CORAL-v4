@@ -1,0 +1,68 @@
+# @package _global_
+defaults:
+  - _self_
+
+# Session B reference run — first real training with instrumentation enabled.
+# Goal: see if the model can escape the copy-the-input local minimum
+# with a proper compute budget, and collect diagnostics for Session C planning.
+
+model:
+  n_levels: 1
+  level_dims: [512]
+  backbone_dim: 512
+  backbone_layers: 2
+  n_heads: 8
+  d_k: 64
+  ffn_expansion: 4
+  timescale_base: 3
+  use_predictive_coding: false
+  use_crystallisation: false
+  use_amort: false
+  use_local_attention_bias: false
+  K_max: 16                          # full budget, matches Sudoku reference
+  inner_steps_override: 18
+  grad_inner_steps: 6
+  vocab_size: 6
+  embed_scale: true
+  use_consolidation_step: false      # off; clean baseline
+  mode: "baseline"
+
+training:
+  batch_size: 8                      # halved vs smoke (K_max=16 x 18 steps eats memory)
+  learning_rate: 7e-5
+  weight_decay: 1.0
+  epochs: 3000
+  eval_every: 200                    # 15 quick evals across the run
+  pareto_eval_every: 1000            # ENABLED now; 3 Pareto evals across the run
+  quick_eval_samples: 500            # more samples for reliable metrics
+  log_every: 50
+  scheduler: "cosine"
+  warmup_steps: 200
+  precision: "bfloat16"
+  loss_precision: "float64"
+  full_inner_backprop: true
+  optimizer: "adamw"
+  compile_model: false
+  deep_supervision_weighting: "uniform"
+
+data:
+  dataset: "maze_30x30_hard"
+  dataset_path: "data/maze-30x30-hard-1k"
+  seq_len: 900
+  grid_height: 30
+  grid_width: 30
+  augmentation_factor: 1
+  eval_size: 1000
+  num_workers: 1
+
+wandb:
+  project: "CORAL-v4-maze"
+  entity: "aktuator-ai"
+  run_name: "v4.2-maze-session-B-reference"
+  tags: ["v4.2", "maze", "session-B", "reference", "instrumented"]
+  disabled: false
+  log_every: 50
+
+seed: 42
+device: "cuda"
+experiment_name: "phase1_maze_reference"

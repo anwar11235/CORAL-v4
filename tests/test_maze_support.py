@@ -216,8 +216,10 @@ def test_evaluate_accuracy_returns_maze_metrics():
     assert "eval/bucket_0_29_token_acc" not in metrics
 
     for k, v in metrics.items():
-        if k != "eval/avg_halting_step":
-            assert 0.0 <= v <= 1.0, f"{k}={v} out of range"
+        # avg_halting_step and velocity deltas (L2 norms) are not bounded to [0,1]
+        if k == "eval/avg_halting_step" or "delta" in k or k.startswith("repr/"):
+            continue
+        assert 0.0 <= v <= 1.0, f"{k}={v} out of range"
 
 
 # ---------------------------------------------------------------------------
@@ -261,3 +263,257 @@ def test_evaluate_accuracy_preserves_sudoku_metrics():
     assert "eval/token_accuracy" in metrics
     assert "eval/path_accuracy" not in metrics
     assert "eval/wall_accuracy" not in metrics
+
+
+# ---------------------------------------------------------------------------
+# Test 7: evaluate_pareto returns maze metrics for maze dataset
+# ---------------------------------------------------------------------------
+
+def test_evaluate_pareto_returns_maze_metrics():
+    """evaluate_pareto with dataset_name='maze_30x30_hard' returns maze metrics at each K."""
+    from coral.evaluation.pareto import evaluate_pareto
+    from torch.utils.data import DataLoader, Dataset
+
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=4,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=6, mode="baseline",
+        inner_steps_override=2,
+        use_local_attention_bias=False,
+    )
+    cfg = CoralConfig(model=model_cfg, device="cpu")
+
+    adapter = GridAdapter(cfg, vocab_size=6, grid_height=10, grid_width=10)
+    core = CoralCore(model_cfg)
+
+    class TinyMaze(Dataset):
+        def __len__(self): return 4
+        def __getitem__(self, i):
+            inp = torch.randint(1, 5, (100,), dtype=torch.long)
+            lbl = inp.clone()
+            lbl[::10] = 5
+            return {"inputs": inp, "labels": lbl}
+
+    loader = DataLoader(TinyMaze(), batch_size=2)
+    metrics = evaluate_pareto(
+        adapter=adapter, core=core, dataloader=loader,
+        device=torch.device("cpu"), dtype=torch.float32,
+        dataset_name="maze_30x30_hard",
+    )
+
+    # Per-K maze metrics present for K <= K_max=4
+    for k in [1, 2, 4]:
+        assert f"eval/pareto_k{k}_path_accuracy" in metrics, \
+            f"Missing pareto_k{k}_path_accuracy. Got: {list(metrics.keys())}"
+        assert f"eval/pareto_k{k}_wall_accuracy" in metrics
+    # K=8 and K=16 skipped (exceeds K_max=4)
+    assert "eval/pareto_k8_path_accuracy" not in metrics
+    assert "eval/pareto_k16_path_accuracy" not in metrics
+    # Pareto area scalar present
+    assert "eval/pareto_area_path_accuracy" in metrics
+    assert "eval/pareto_area_exact_accuracy" in metrics
+    # No Sudoku bucket leakage
+    assert not any("bucket_" in k for k in metrics.keys()), \
+        "Sudoku bucket metrics leaked into maze Pareto eval"
+
+
+# ---------------------------------------------------------------------------
+# Test 8: evaluate_pareto preserves Sudoku metrics by default
+# ---------------------------------------------------------------------------
+
+def test_evaluate_pareto_preserves_sudoku_metrics():
+    """evaluate_pareto default behaviour must preserve existing Sudoku metrics."""
+    from coral.evaluation.pareto import evaluate_pareto
+    from torch.utils.data import DataLoader, Dataset
+
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=4,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=11, mode="baseline",
+        inner_steps_override=2,
+    )
+    cfg = CoralConfig(model=model_cfg, device="cpu")
+
+    adapter = GridAdapter(cfg, vocab_size=11, grid_height=9, grid_width=9)
+    core = CoralCore(model_cfg)
+
+    class TinySudoku(Dataset):
+        def __len__(self): return 4
+        def __getitem__(self, i):
+            inp = torch.randint(1, 11, (81,), dtype=torch.long)
+            lbl = torch.randint(2, 11, (81,), dtype=torch.long)
+            return {"inputs": inp, "labels": lbl}
+
+    loader = DataLoader(TinySudoku(), batch_size=2)
+    metrics = evaluate_pareto(
+        adapter=adapter, core=core, dataloader=loader,
+        device=torch.device("cpu"), dtype=torch.float32,
+        K_values=[1, 2, 4],
+        # dataset_name defaults to "sudoku_extreme_1k"
+    )
+
+    assert "eval/exact_accuracy" in metrics
+    assert "eval/accuracy@K1" in metrics
+    assert "eval/pareto_area" in metrics
+    assert "eval/pareto_area_exact_accuracy" in metrics
+    # No maze metrics
+    assert "eval/pareto_k1_path_accuracy" not in metrics
+    assert "eval/pareto_area_path_accuracy" not in metrics
+
+
+# ---------------------------------------------------------------------------
+# Test 9: CoralCore collects inner-step states from the final segment
+# ---------------------------------------------------------------------------
+
+def test_coral_core_collects_inner_step_states():
+    """CoralCore.forward with collect_inner_step_states=True returns per-step states."""
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=3,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=6, mode="baseline",
+        inner_steps_override=4,
+        use_local_attention_bias=False,
+        use_consolidation_step=False,  # disable so step count == inner_steps_override
+    )
+    cfg = CoralConfig(model=model_cfg, device="cpu")
+
+    core = CoralCore(model_cfg)
+    z1_init = torch.randn(2, 100, 64)
+    with torch.no_grad():
+        out = core(z1_init, K_max=3, training=False, decode_fn=None,
+                   collect_inner_step_states=True)
+
+    assert out.last_segment_inner_states is not None
+    assert len(out.last_segment_inner_states) == 4, (
+        f"Expected 4 inner-step states (inner_steps_override=4), "
+        f"got {len(out.last_segment_inner_states)}"
+    )
+    for s in out.last_segment_inner_states:
+        assert s.shape == (2, 100, 64)
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Inner-step collection is off by default
+# ---------------------------------------------------------------------------
+
+def test_coral_core_inner_state_collection_off_by_default():
+    """Without the flag, last_segment_inner_states must be None."""
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=6, mode="baseline",
+        inner_steps_override=2,
+        use_local_attention_bias=False,
+    )
+    cfg = CoralConfig(model=model_cfg, device="cpu")
+
+    core = CoralCore(model_cfg)
+    z1_init = torch.randn(2, 100, 64)
+    with torch.no_grad():
+        out = core(z1_init, K_max=2, training=False, decode_fn=None)
+    assert out.last_segment_inner_states is None
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Per-segment metrics emitted for maze evaluate_accuracy
+# ---------------------------------------------------------------------------
+
+def test_per_segment_metrics_emitted_for_maze():
+    """evaluate_accuracy with maze emits seg_{i}_path_accuracy keys."""
+    from coral.evaluation.evaluator import evaluate_accuracy
+    from torch.utils.data import DataLoader, Dataset
+
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=4,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=6, mode="baseline",
+        inner_steps_override=3,
+        use_local_attention_bias=False,
+    )
+    cfg = CoralConfig(model=model_cfg, device="cpu")
+
+    adapter = GridAdapter(cfg, vocab_size=6, grid_height=10, grid_width=10)
+    core = CoralCore(model_cfg)
+
+    class TinyMaze(Dataset):
+        def __len__(self): return 4
+        def __getitem__(self, i):
+            inp = torch.randint(1, 5, (100,), dtype=torch.long)
+            lbl = inp.clone()
+            lbl[::10] = 5
+            return {"inputs": inp, "labels": lbl}
+
+    loader = DataLoader(TinyMaze(), batch_size=2)
+    metrics = evaluate_accuracy(
+        adapter=adapter, core=core, dataloader=loader,
+        device=torch.device("cpu"), dtype=torch.float32,
+        max_puzzles=4, dataset_name="maze_30x30_hard",
+        # K_override=None so per-segment collection is active
+    )
+
+    # Per-segment metrics present (K_max=4 ≤ 5, so all 4 segments are checkpoints)
+    assert "eval/seg_0_path_accuracy" in metrics, \
+        f"Missing seg_0_path_accuracy. Got: {[k for k in metrics if 'seg_' in k]}"
+    later_seg_keys = [k for k in metrics if k.startswith("eval/seg_") and "path_accuracy" in k]
+    assert len(later_seg_keys) >= 2, f"Expected ≥2 seg_* metrics, got {later_seg_keys}"
+    # Velocity metrics present (inner_steps_override=3, so 2 deltas)
+    assert "eval/last_seg_inner_step_delta_mean" in metrics
+    assert "eval/last_seg_inner_step_delta_final" in metrics
+
+
+# ---------------------------------------------------------------------------
+# Test 12: compute_repr_diagnostics works on maze data
+# ---------------------------------------------------------------------------
+
+def test_repr_diagnostics_maze():
+    """compute_repr_diagnostics should run on maze data and return finite values."""
+    import math
+    from coral.evaluation.repr_diagnostics import compute_repr_diagnostics
+    from torch.utils.data import DataLoader, Dataset
+
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=6, mode="baseline",
+        inner_steps_override=2,
+        use_local_attention_bias=False,
+    )
+    cfg = CoralConfig(model=model_cfg, device="cpu")
+
+    adapter = GridAdapter(cfg, vocab_size=6, grid_height=10, grid_width=10)
+    core = CoralCore(model_cfg)
+
+    class TinyMaze(Dataset):
+        def __len__(self): return 8
+        def __getitem__(self, i):
+            inp = torch.randint(1, 5, (100,), dtype=torch.long)
+            lbl = inp.clone()
+            # Mark ~10 cells as optimal path
+            lbl[torch.randperm(100)[:10]] = 5
+            return {"inputs": inp, "labels": lbl}
+
+    loader = DataLoader(TinyMaze(), batch_size=4)
+    metrics = compute_repr_diagnostics(
+        adapter=adapter, core=core, dataloader=loader,
+        max_puzzles=8, interesting_token=5, mask_from="labels",
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+
+    assert "repr/inter_position_similarity" in metrics, f"Got: {list(metrics.keys())}"
+    assert "repr/effective_rank" in metrics
+    assert "repr/state_norm_mean" in metrics
+    assert "repr/state_norm_std" in metrics
+    for k, v in metrics.items():
+        assert math.isfinite(v), f"{k} = {v} is not finite"

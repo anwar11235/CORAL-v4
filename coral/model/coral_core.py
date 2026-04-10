@@ -75,6 +75,8 @@ class CoralOutput:
     crystal_stats: List[Dict] = field(default_factory=list)
     commit_losses: List[torch.Tensor] = field(default_factory=list)
     dis_losses: List[torch.Tensor] = field(default_factory=list)
+    # Per-inner-step states from the final segment (None unless collect_inner_step_states=True)
+    last_segment_inner_states: Optional[List[torch.Tensor]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +187,7 @@ class CoralCore(nn.Module):
         conditioning: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
         input_injection: Optional[torch.Tensor] = None,
+        _states_collector: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Run backbone recursion for one level.
 
@@ -269,12 +272,16 @@ class CoralCore(nn.Module):
             with torch.no_grad():
                 for t in range(no_grad_steps):
                     z = _step(z, t)
+                    if _states_collector is not None:
+                        _states_collector.append(z.detach().clone())
 
         # Gradient steps: backprop flows through these only.
         # z entering here has no grad_fn (produced by no_grad warmup or
         # initial call site); the grad steps build a fresh computation graph.
         for t in range(no_grad_steps, n_steps):
             z = _step(z, t)
+            if _states_collector is not None:
+                _states_collector.append(z.detach().clone())
 
         # Consolidation step: one backbone pass with NO input_injection, always in-graph.
         # Uses timescale index n_steps (one beyond the last injection step) so the
@@ -282,6 +289,8 @@ class CoralCore(nn.Module):
         # The +4 buffer in TimescaleEmbedding's max_steps ensures this index is valid.
         if use_consolidation:
             z = _step(z, n_steps, inject=False)
+            if _states_collector is not None:
+                _states_collector.append(z.detach().clone())
 
         return z
 
@@ -292,6 +301,7 @@ class CoralCore(nn.Module):
         training: bool = True,
         decode_fn: Optional[callable] = None,
         attention_masks: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        collect_inner_step_states: bool = False,
     ) -> CoralOutput:
         """Run the full reasoning loop.
 
@@ -377,6 +387,13 @@ class CoralCore(nn.Module):
             seg_pi: Dict[str, torch.Tensor] = {}
             seg_crystal_stats: Dict = {}
 
+            # Prepare inner-step state collector for the final segment's level-0 only.
+            # Collecting from all segments would blow up memory at K_max=16.
+            is_final_seg = (seg == K_max - 1)
+            _inner_collector: Optional[List[torch.Tensor]] = (
+                [] if (collect_inner_step_states and is_final_seg) else None
+            )
+
             if self.effective_mode == "baseline":
                 # ------------------------------------------------------------
                 # Baseline mode: no predictive coding, all levels run bottom-up.
@@ -396,6 +413,7 @@ class CoralCore(nn.Module):
                         conditioning=None,
                         attention_bias=attn_bias,
                         input_injection=input_signal if i == 0 else None,
+                        _states_collector=_inner_collector if i == 0 else None,
                     )
 
             else:
@@ -444,6 +462,7 @@ class CoralCore(nn.Module):
                     z_states[i] = self._run_level(
                         z_states[i], i, n_steps, conditioning=cond, attention_bias=attn_bias,
                         input_injection=input_signal,
+                        _states_collector=_inner_collector if i == 0 else None,
                     )
 
                     # Compute precision-weighted error and project upward
@@ -464,6 +483,10 @@ class CoralCore(nn.Module):
                 # ----------------------------------------------------------------
                 if use_crys:
                     self.crystallisation_manager.monitor.check_decrystallisation(z_states[0])
+
+            # Store inner-step states from the final segment (diagnostic only).
+            if _inner_collector is not None:
+                output.last_segment_inner_states = _inner_collector
 
             # ----------------------------------------------------------------
             # Crystallisation losses (accumulated once per segment).

@@ -232,6 +232,7 @@ def main(cfg: DictConfig) -> None:
                     dataloader=eval_loader,
                     device=device,
                     dtype=torch.bfloat16,
+                    dataset_name=config.data.dataset,
                 )
                 _log_precision_metrics(trainer, eval_loader, device, pareto_results)
                 if wandb_run is not None:

@@ -4,13 +4,14 @@ Computes exact accuracy (full puzzle correct) and token accuracy (per-cell)
 on the Sudoku-Extreme-1K evaluation set.
 """
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from coral.data.sudoku_dataset import IGNORE_LABEL_ID
+from coral.evaluation.repr_diagnostics import compute_repr_diagnostics
 
 # Difficulty buckets defined as (key_suffix, min_empty_inclusive, max_empty_inclusive).
 # Empty cells are encoded as token value 1 in the input tensor.
@@ -67,7 +68,11 @@ def evaluate_accuracy(
             for key in {"0_29", "30_49", "50_59", "60_plus"}.
 
         For maze: also includes eval/path_accuracy, eval/wall_accuracy,
-            eval/non_path_accuracy.
+            eval/non_path_accuracy, per-segment path accuracy, inner-step
+            velocity, and repr/* diagnostics.
+
+        Repr diagnostics (repr/*) are added for both datasets when
+        K_override is None (full-depth eval only, not Pareto forced-K calls).
     """
     adapter.eval()
     core.eval()
@@ -101,6 +106,21 @@ def evaluate_accuracy(
 
     K_max = K_override if K_override is not None else core.config.K_max
 
+    # Per-segment accumulators (maze only, full-depth eval only).
+    collect_maze_diag = (dataset_name == "maze_30x30_hard") and (K_override is None)
+    if collect_maze_diag:
+        if K_max <= 5:
+            seg_checkpoints = list(range(K_max))
+        else:
+            seg_checkpoints = sorted(set([
+                0, K_max // 4, K_max // 2, 3 * K_max // 4, K_max - 1,
+            ]))
+        seg_path_corr: Dict[int, int] = {s: 0 for s in seg_checkpoints}
+        seg_path_tot_d: Dict[int, int] = {s: 0 for s in seg_checkpoints}
+        seg_exact_corr: Dict[int, int] = {s: 0 for s in seg_checkpoints}
+        seg_exact_tot_d: Dict[int, int] = {s: 0 for s in seg_checkpoints}
+        inner_step_delta_accum: List[List[float]] = []
+
     with torch.no_grad():
         for batch in dataloader:
             inputs = batch["inputs"].to(device)
@@ -115,6 +135,7 @@ def evaluate_accuracy(
                     training=False,
                     decode_fn=adapter.decode,
                     attention_masks=attention_masks,
+                    collect_inner_step_states=collect_maze_diag,
                 )
 
             logits = output.all_logits[-1] if output.all_logits else adapter.decode(output.z_states[0])
@@ -144,6 +165,27 @@ def evaluate_accuracy(
                 non_path_correct += (correct & non_path_mask & mask).sum().item()
                 non_path_total += (non_path_mask & mask).sum().item()
 
+            # Per-segment + velocity accumulators (maze, full-depth only).
+            if collect_maze_diag:
+                for seg_idx in seg_checkpoints:
+                    if seg_idx < len(output.all_logits):
+                        sl = output.all_logits[seg_idx]
+                        sp = sl.argmax(dim=-1)
+                        pm = (labels == 5)
+                        seg_path_corr[seg_idx] += ((sp == labels) & pm).sum().item()
+                        seg_path_tot_d[seg_idx] += pm.sum().item()
+                        seg_exact_corr[seg_idx] += (sp == labels).all(dim=-1).sum().item()
+                        seg_exact_tot_d[seg_idx] += B
+
+                if (output.last_segment_inner_states is not None
+                        and len(output.last_segment_inner_states) >= 2):
+                    sts = output.last_segment_inner_states
+                    batch_deltas = [
+                        (sts[i] - sts[i - 1]).norm(dim=-1).mean().item()
+                        for i in range(1, len(sts))
+                    ]
+                    inner_step_delta_accum.append(batch_deltas)
+
             # Per-puzzle bucket accumulators.
             for b in range(B):
                 n_empty = int(empty_mask[b].sum().item())
@@ -168,7 +210,7 @@ def evaluate_accuracy(
     avg_halt = total_segments / max(total_puzzles // B if B > 0 else 1, 1)
 
     if dataset_name == "maze_30x30_hard":
-        return {
+        maze_metrics: Dict[str, float] = {
             "eval/exact_accuracy": exact_acc,
             "eval/token_accuracy": token_acc,
             "eval/path_accuracy": path_correct / max(path_total, 1),
@@ -176,6 +218,38 @@ def evaluate_accuracy(
             "eval/non_path_accuracy": non_path_correct / max(non_path_total, 1),
             "eval/avg_halting_step": avg_halt,
         }
+        # Per-segment path accuracy and exact accuracy.
+        if collect_maze_diag:
+            for seg_idx in seg_checkpoints:
+                maze_metrics[f"eval/seg_{seg_idx}_path_accuracy"] = (
+                    seg_path_corr[seg_idx] / max(seg_path_tot_d[seg_idx], 1)
+                )
+                maze_metrics[f"eval/seg_{seg_idx}_exact_accuracy"] = (
+                    seg_exact_corr[seg_idx] / max(seg_exact_tot_d[seg_idx], 1)
+                )
+            # Inner-step velocity statistics.
+            if inner_step_delta_accum:
+                n_bv = len(inner_step_delta_accum)
+                n_sv = len(inner_step_delta_accum[0])
+                avg_deltas = [
+                    sum(b[i] for b in inner_step_delta_accum) / n_bv
+                    for i in range(n_sv)
+                ]
+                maze_metrics["eval/last_seg_inner_step_delta_mean"] = (
+                    sum(avg_deltas) / len(avg_deltas)
+                )
+                maze_metrics["eval/last_seg_inner_step_delta_final"] = avg_deltas[-1]
+                for i, d in enumerate(avg_deltas):
+                    maze_metrics[f"eval/last_seg_inner_step_{i}_delta"] = d
+            # Repr diagnostics (maze path cells).
+            repr_max = 64 if max_puzzles is None else min(max_puzzles, 64)
+            repr_m = compute_repr_diagnostics(
+                adapter=adapter, core=core, dataloader=dataloader,
+                max_puzzles=repr_max, interesting_token=5, mask_from="labels",
+                device=device, dtype=dtype,
+            )
+            maze_metrics.update(repr_m)
+        return maze_metrics
 
     metrics: Dict[str, float] = {
         "eval/exact_accuracy": exact_acc,
@@ -195,5 +269,15 @@ def evaluate_accuracy(
             acc["empty_correct"] / acc["empty_total"] if acc["empty_total"] > 0 else 0.0
         )
         metrics[f"eval/bucket_{key}_exact_acc"] = acc["exact_correct"] / n if n > 0 else 0.0
+
+    # Repr diagnostics for Sudoku (empty cells) — full-depth eval only.
+    if K_override is None:
+        repr_max = 64 if max_puzzles is None else min(max_puzzles, 64)
+        repr_m = compute_repr_diagnostics(
+            adapter=adapter, core=core, dataloader=dataloader,
+            max_puzzles=repr_max, interesting_token=1, mask_from="inputs",
+            device=device, dtype=dtype,
+        )
+        metrics.update(repr_m)
 
     return metrics
