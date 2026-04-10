@@ -167,3 +167,97 @@ def test_coral_core_forward_maze_shapes():
         f"Expected z_states[0] shape (2, 900, 512), got {output.z_states[0].shape}"
     )
     assert output.z_states[0].isfinite().all(), "CoralCore output contains NaN or Inf"
+
+
+# ---------------------------------------------------------------------------
+# Test 5: evaluate_accuracy returns maze metrics for maze dataset
+# ---------------------------------------------------------------------------
+
+def test_evaluate_accuracy_returns_maze_metrics():
+    """evaluate_accuracy with dataset_name='maze_30x30_hard' returns maze-specific keys."""
+    from coral.evaluation.evaluator import evaluate_accuracy
+    from torch.utils.data import DataLoader, Dataset
+
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=6, mode="baseline",
+        inner_steps_override=2,
+        use_local_attention_bias=False,
+    )
+    cfg = CoralConfig(model=model_cfg, device="cpu")
+
+    adapter = GridAdapter(cfg, vocab_size=6, grid_height=10, grid_width=10)
+    core = CoralCore(model_cfg)
+
+    class TinyMaze(Dataset):
+        def __len__(self): return 4
+        def __getitem__(self, i):
+            inp = torch.randint(1, 5, (100,), dtype=torch.long)
+            lbl = inp.clone()
+            lbl[::10] = 5  # mark some cells as optimal path
+            return {"inputs": inp, "labels": lbl}
+
+    loader = DataLoader(TinyMaze(), batch_size=2)
+    metrics = evaluate_accuracy(
+        adapter=adapter, core=core, dataloader=loader,
+        device=torch.device("cpu"), dtype=torch.float32,
+        max_puzzles=4, dataset_name="maze_30x30_hard",
+    )
+
+    assert "eval/path_accuracy" in metrics, f"Missing eval/path_accuracy. Got: {list(metrics.keys())}"
+    assert "eval/wall_accuracy" in metrics
+    assert "eval/non_path_accuracy" in metrics
+    assert "eval/exact_accuracy" in metrics
+    assert "eval/token_accuracy" in metrics
+    assert "eval/bucket_60_plus_empty_acc" not in metrics, "Sudoku metrics leaked into maze eval"
+    assert "eval/bucket_0_29_token_acc" not in metrics
+
+    for k, v in metrics.items():
+        if k != "eval/avg_halting_step":
+            assert 0.0 <= v <= 1.0, f"{k}={v} out of range"
+
+
+# ---------------------------------------------------------------------------
+# Test 6: evaluate_accuracy preserves Sudoku metrics by default
+# ---------------------------------------------------------------------------
+
+def test_evaluate_accuracy_preserves_sudoku_metrics():
+    """evaluate_accuracy with default dataset_name returns Sudoku bucket metrics unchanged."""
+    from coral.evaluation.evaluator import evaluate_accuracy
+    from torch.utils.data import DataLoader, Dataset
+
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=11, mode="baseline",
+        inner_steps_override=2,
+    )
+    cfg = CoralConfig(model=model_cfg, device="cpu")
+
+    adapter = GridAdapter(cfg, vocab_size=11, grid_height=9, grid_width=9)
+    core = CoralCore(model_cfg)
+
+    class TinySudoku(Dataset):
+        def __len__(self): return 4
+        def __getitem__(self, i):
+            inp = torch.randint(1, 11, (81,), dtype=torch.long)
+            lbl = torch.randint(2, 11, (81,), dtype=torch.long)
+            return {"inputs": inp, "labels": lbl}
+
+    loader = DataLoader(TinySudoku(), batch_size=2)
+    metrics = evaluate_accuracy(
+        adapter=adapter, core=core, dataloader=loader,
+        device=torch.device("cpu"), dtype=torch.float32,
+        max_puzzles=4,
+        # dataset_name defaults to "sudoku_extreme_1k"
+    )
+
+    assert "eval/exact_accuracy" in metrics
+    assert "eval/token_accuracy" in metrics
+    assert "eval/path_accuracy" not in metrics
+    assert "eval/wall_accuracy" not in metrics

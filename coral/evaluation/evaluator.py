@@ -38,6 +38,7 @@ def evaluate_accuracy(
     dtype: torch.dtype = torch.bfloat16,
     K_override: Optional[int] = None,
     max_puzzles: Optional[int] = None,
+    dataset_name: str = "sudoku_extreme_1k",
 ) -> Dict[str, float]:
     """Evaluate exact and token accuracy on a full evaluation dataset.
 
@@ -45,22 +46,28 @@ def evaluate_accuracy(
     are applied identically to the training forward pass.
 
     Args:
-        adapter:     GridAdapter for encode/decode.
-        core:        CoralCore for reasoning.
-        dataloader:  Evaluation DataLoader.
-        device:      Compute device.
-        dtype:       Forward pass dtype.
-        K_override:  If provided, force exactly K segments.
-        max_puzzles: If provided, stop after this many puzzles (quick eval).
+        adapter:      GridAdapter for encode/decode.
+        core:         CoralCore for reasoning.
+        dataloader:   Evaluation DataLoader.
+        device:       Compute device.
+        dtype:        Forward pass dtype.
+        K_override:   If provided, force exactly K segments.
+        max_puzzles:  If provided, stop after this many puzzles (quick eval).
+        dataset_name: Dataset identifier. Controls which metrics are emitted.
+                      "maze_30x30_hard" → maze metrics (path/wall/non_path accuracy).
+                      Anything else → Sudoku bucket metrics (default behaviour).
 
     Returns:
         Dict with overall metrics (eval/exact_accuracy, eval/token_accuracy,
-        eval/avg_halting_step) plus per-difficulty-bucket metrics:
-            eval/bucket_{key}_count
-            eval/bucket_{key}_token_acc
-            eval/bucket_{key}_empty_acc
-            eval/bucket_{key}_exact_acc
-        for key in {"0_29", "30_49", "50_59", "60_plus"}.
+        eval/avg_halting_step).
+
+        For Sudoku: also includes per-difficulty-bucket metrics:
+            eval/bucket_{key}_count, eval/bucket_{key}_token_acc,
+            eval/bucket_{key}_empty_acc, eval/bucket_{key}_exact_acc
+            for key in {"0_29", "30_49", "50_59", "60_plus"}.
+
+        For maze: also includes eval/path_accuracy, eval/wall_accuracy,
+            eval/non_path_accuracy.
     """
     adapter.eval()
     core.eval()
@@ -70,6 +77,14 @@ def evaluate_accuracy(
     token_correct = 0
     token_total = 0
     total_segments = 0
+
+    # Maze-specific accumulators (only used when dataset_name == "maze_30x30_hard").
+    path_correct = 0
+    path_total = 0
+    wall_correct = 0
+    wall_total = 0
+    non_path_correct = 0
+    non_path_total = 0
 
     # Per-bucket accumulators: puzzles, token correct/total, empty correct/total, exact correct.
     bucket_acc: Dict[str, Dict[str, int]] = {
@@ -117,6 +132,18 @@ def evaluate_accuracy(
             total_puzzles += B
             total_segments += num_segs
 
+            # Maze-specific accumulators.
+            if dataset_name == "maze_30x30_hard":
+                path_mask = (labels == 5)
+                wall_mask = (labels == 2)
+                non_path_mask = (labels != 5)
+                path_correct += (correct & path_mask).sum().item()
+                path_total += path_mask.sum().item()
+                wall_correct += (correct & wall_mask).sum().item()
+                wall_total += wall_mask.sum().item()
+                non_path_correct += (correct & non_path_mask & mask).sum().item()
+                non_path_total += (non_path_mask & mask).sum().item()
+
             # Per-puzzle bucket accumulators.
             for b in range(B):
                 n_empty = int(empty_mask[b].sum().item())
@@ -136,10 +163,24 @@ def evaluate_accuracy(
             if max_puzzles is not None and total_puzzles >= max_puzzles:
                 break
 
+    exact_acc = exact_correct / max(total_puzzles, 1)
+    token_acc = token_correct / max(token_total, 1)
+    avg_halt = total_segments / max(total_puzzles // B if B > 0 else 1, 1)
+
+    if dataset_name == "maze_30x30_hard":
+        return {
+            "eval/exact_accuracy": exact_acc,
+            "eval/token_accuracy": token_acc,
+            "eval/path_accuracy": path_correct / max(path_total, 1),
+            "eval/wall_accuracy": wall_correct / max(wall_total, 1),
+            "eval/non_path_accuracy": non_path_correct / max(non_path_total, 1),
+            "eval/avg_halting_step": avg_halt,
+        }
+
     metrics: Dict[str, float] = {
-        "eval/exact_accuracy": exact_correct / max(total_puzzles, 1),
-        "eval/token_accuracy": token_correct / max(token_total, 1),
-        "eval/avg_halting_step": total_segments / max(total_puzzles // B if B > 0 else 1, 1),
+        "eval/exact_accuracy": exact_acc,
+        "eval/token_accuracy": token_acc,
+        "eval/avg_halting_step": avg_halt,
     }
 
     # Flatten per-bucket stats into metric keys.

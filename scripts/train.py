@@ -214,6 +214,7 @@ def main(cfg: DictConfig) -> None:
                     device=device,
                     dtype=torch.bfloat16,
                     max_puzzles=config.training.quick_eval_samples,
+                    dataset_name=config.data.dataset,
                 )
                 if wandb_run is not None:
                     wandb_run.log(quick_metrics, step=step)
