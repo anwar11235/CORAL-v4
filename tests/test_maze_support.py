@@ -216,8 +216,9 @@ def test_evaluate_accuracy_returns_maze_metrics():
     assert "eval/bucket_0_29_token_acc" not in metrics
 
     for k, v in metrics.items():
-        # avg_halting_step and velocity deltas (L2 norms) are not bounded to [0,1]
-        if k == "eval/avg_halting_step" or "delta" in k or k.startswith("repr/"):
+        # avg_halting_step, velocity deltas, repr diagnostics, and raw norms are not bounded to [0,1]
+        if (k == "eval/avg_halting_step" or "delta" in k
+                or k.startswith("repr/") or k.startswith("norms/")):
             continue
         assert 0.0 <= v <= 1.0, f"{k}={v} out of range"
 
@@ -620,4 +621,157 @@ def test_evaluate_pareto_does_not_collect_inner_states():
     assert not any(forward_calls), (
         f"evaluate_pareto set collect_inner_step_states=True in "
         f"{sum(forward_calls)}/{len(forward_calls)} calls"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 15: CoralCore.forward collects state norms when requested
+# ---------------------------------------------------------------------------
+
+def test_coral_core_collects_state_norms():
+    """collect_state_norms=True populates state_norm_trace with expected keys."""
+    model_cfg = _make_maze_model_config(K_max=3, inner_steps_override=4)
+
+    core = CoralCore(model_cfg)
+    z1 = torch.randn(2, 100, 512)
+
+    with torch.no_grad():
+        out = core(z1, K_max=3, training=False, decode_fn=None,
+                   collect_state_norms=True)
+
+    assert out.state_norm_trace is not None, "state_norm_trace should not be None"
+    trace = out.state_norm_trace
+
+    # z1_init: one scalar
+    assert "z1_init" in trace and len(trace["z1_init"]) == 1
+
+    # post_backbone: inner_steps_override=4 steps × 3 segments = 12 entries
+    assert "post_backbone" in trace
+    assert len(trace["post_backbone"]) > 0, "post_backbone list is empty"
+
+    # segment_end and post_detach: 3 segments, but post_detach only logged when
+    # the loop doesn't break early — at minimum 1 entry for segment_end
+    assert "segment_end" in trace and len(trace["segment_end"]) > 0
+    assert "post_detach" in trace
+
+    # All values are plain Python floats (no tensors)
+    for key, vals in trace.items():
+        for v in vals:
+            assert isinstance(v, float), f"trace[{key}] contains non-float: {type(v)}"
+
+
+# ---------------------------------------------------------------------------
+# Test 16: state_norm_trace is None by default
+# ---------------------------------------------------------------------------
+
+def test_coral_core_state_norms_off_by_default():
+    """Without collect_state_norms=True, state_norm_trace must be None."""
+    model_cfg = _make_maze_model_config(K_max=2, inner_steps_override=2)
+
+    core = CoralCore(model_cfg)
+    z1 = torch.randn(2, 100, 512)
+
+    with torch.no_grad():
+        out = core(z1, K_max=2, training=False, decode_fn=None)
+
+    assert out.state_norm_trace is None, (
+        f"state_norm_trace should be None when collect_state_norms=False, "
+        f"got {out.state_norm_trace}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 17: evaluate_accuracy emits norms/* metrics in quick eval
+# ---------------------------------------------------------------------------
+
+def test_norm_metrics_emitted_in_quick_eval():
+    """evaluate_accuracy with collect_diagnostics=True emits norms/* keys."""
+    from coral.evaluation.evaluator import evaluate_accuracy
+    from torch.utils.data import DataLoader, Dataset
+
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=6, mode="baseline",
+        inner_steps_override=2,
+        use_local_attention_bias=False,
+        use_consolidation_step=False,
+    )
+    cfg = CoralConfig(model=model_cfg, device="cpu")
+
+    adapter = GridAdapter(cfg, vocab_size=6, grid_height=10, grid_width=10)
+    core = CoralCore(model_cfg)
+
+    class TinyMaze(Dataset):
+        def __len__(self): return 4
+        def __getitem__(self, i):
+            inp = torch.randint(1, 5, (100,), dtype=torch.long)
+            lbl = inp.clone()
+            lbl[::10] = 5
+            return {"inputs": inp, "labels": lbl}
+
+    loader = DataLoader(TinyMaze(), batch_size=2)
+    metrics = evaluate_accuracy(
+        adapter=adapter, core=core, dataloader=loader,
+        device=torch.device("cpu"), dtype=torch.float32,
+        max_puzzles=4, dataset_name="maze_30x30_hard",
+        collect_diagnostics=True,
+    )
+
+    norm_keys = [k for k in metrics if k.startswith("norms/")]
+    assert len(norm_keys) >= 4, f"Expected ≥4 norms/* keys, got {norm_keys}"
+    assert "norms/z1_init" in metrics
+    assert "norms/post_backbone_mean" in metrics
+    assert "norms/segment_end_mean" in metrics
+    import math
+    for k in norm_keys:
+        assert math.isfinite(metrics[k]), f"{k}={metrics[k]} is not finite"
+
+
+# ---------------------------------------------------------------------------
+# Test 18: norms/* absent when collect_diagnostics=False
+# ---------------------------------------------------------------------------
+
+def test_norm_metrics_absent_without_diagnostics():
+    """evaluate_accuracy with collect_diagnostics=False must not emit norms/* keys."""
+    from coral.evaluation.evaluator import evaluate_accuracy
+    from torch.utils.data import DataLoader, Dataset
+
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=6, mode="baseline",
+        inner_steps_override=2,
+        use_local_attention_bias=False,
+        use_consolidation_step=False,
+    )
+    cfg = CoralConfig(model=model_cfg, device="cpu")
+
+    adapter = GridAdapter(cfg, vocab_size=6, grid_height=10, grid_width=10)
+    core = CoralCore(model_cfg)
+
+    class TinyMaze(Dataset):
+        def __len__(self): return 4
+        def __getitem__(self, i):
+            inp = torch.randint(1, 5, (100,), dtype=torch.long)
+            lbl = inp.clone()
+            lbl[::10] = 5
+            return {"inputs": inp, "labels": lbl}
+
+    loader = DataLoader(TinyMaze(), batch_size=2)
+    metrics = evaluate_accuracy(
+        adapter=adapter, core=core, dataloader=loader,
+        device=torch.device("cpu"), dtype=torch.float32,
+        max_puzzles=4, dataset_name="maze_30x30_hard",
+        collect_diagnostics=False,
+    )
+
+    norm_keys = [k for k in metrics if k.startswith("norms/")]
+    assert len(norm_keys) == 0, (
+        f"norms/* keys should be absent when collect_diagnostics=False, "
+        f"got {norm_keys}"
     )

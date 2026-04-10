@@ -28,6 +28,47 @@ def _bucket_key(n_empty: int) -> str:
     for key, lo, hi in _DIFFICULTY_BUCKETS:
         if lo <= n_empty <= hi:
             return key
+
+
+def _summarize_norm_trace(
+    trace: Dict[str, List[float]],
+) -> Dict[str, float]:
+    """Flatten a state_norm_trace into scalar metrics for logging.
+
+    Emits:
+        norms/z1_init             — norm of the initial encoder output
+        norms/injection_delta_mean — mean increase from injection (post - pre)
+        norms/post_backbone_mean  — mean level-0 norm after each backbone step
+        norms/segment_end_mean    — mean level-0 norm at end of each segment
+        norms/segment_end_final   — level-0 norm at end of the last segment
+        norms/post_detach_final   — level-0 norm just after the last detach
+
+    All values are averages over the recorded steps; missing lists return 0.0.
+    """
+    metrics: Dict[str, float] = {}
+
+    z1 = trace.get("z1_init", [])
+    metrics["norms/z1_init"] = z1[0] if z1 else 0.0
+
+    pre = trace.get("pre_injection", [])
+    post = trace.get("post_injection", [])
+    if pre and post and len(pre) == len(post):
+        deltas = [p - r for p, r in zip(post, pre)]
+        metrics["norms/injection_delta_mean"] = sum(deltas) / len(deltas)
+    else:
+        metrics["norms/injection_delta_mean"] = 0.0
+
+    pb = trace.get("post_backbone", [])
+    metrics["norms/post_backbone_mean"] = sum(pb) / len(pb) if pb else 0.0
+
+    se = trace.get("segment_end", [])
+    metrics["norms/segment_end_mean"] = sum(se) / len(se) if se else 0.0
+    metrics["norms/segment_end_final"] = se[-1] if se else 0.0
+
+    pd_ = trace.get("post_detach", [])
+    metrics["norms/post_detach_final"] = pd_[-1] if pd_ else 0.0
+
+    return metrics
     return "60_plus"
 
 
@@ -128,11 +169,17 @@ def evaluate_accuracy(
         seg_exact_tot_d: Dict[int, int] = {s: 0 for s in seg_checkpoints}
         inner_step_delta_accum: List[List[float]] = []
 
+    # State norm trace: collected from the very first batch only (diagnostic, low overhead).
+    _first_batch_norm_trace: Optional[Dict[str, List[float]]] = None
+
     with torch.no_grad():
-        for batch in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
             inputs = batch["inputs"].to(device)
             labels = batch["labels"].to(device)
             B = inputs.shape[0]
+
+            # Collect state norms on the first batch only (when diagnostics enabled).
+            _collect_norms_this_batch = collect_diagnostics and (batch_idx == 0)
 
             with torch.autocast(device_type=device.type, dtype=dtype):
                 z1 = adapter.encode(inputs)
@@ -143,7 +190,11 @@ def evaluate_accuracy(
                     decode_fn=adapter.decode,
                     attention_masks=attention_masks,
                     collect_inner_step_states=collect_maze_diag,
+                    collect_state_norms=_collect_norms_this_batch,
                 )
+
+            if _collect_norms_this_batch and output.state_norm_trace is not None:
+                _first_batch_norm_trace = output.state_norm_trace
 
             logits = output.all_logits[-1] if output.all_logits else adapter.decode(output.z_states[0])
             preds = logits.argmax(dim=-1)
@@ -256,6 +307,9 @@ def evaluate_accuracy(
                 device=device, dtype=dtype,
             )
             maze_metrics.update(repr_m)
+        # State norm diagnostics (first batch only, full-depth eval).
+        if _first_batch_norm_trace is not None:
+            maze_metrics.update(_summarize_norm_trace(_first_batch_norm_trace))
         return maze_metrics
 
     metrics: Dict[str, float] = {
@@ -286,5 +340,9 @@ def evaluate_accuracy(
             device=device, dtype=dtype,
         )
         metrics.update(repr_m)
+
+    # State norm diagnostics (first batch only, full-depth eval).
+    if _first_batch_norm_trace is not None:
+        metrics.update(_summarize_norm_trace(_first_batch_norm_trace))
 
     return metrics

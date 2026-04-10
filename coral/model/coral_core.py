@@ -77,6 +77,10 @@ class CoralOutput:
     dis_losses: List[torch.Tensor] = field(default_factory=list)
     # Per-inner-step states from the final segment (None unless collect_inner_step_states=True)
     last_segment_inner_states: Optional[List[torch.Tensor]] = None
+    # State L2-norm trajectory (None unless collect_state_norms=True).
+    # Keys: z1_init, pre_injection, post_injection, post_backbone, segment_end, post_detach.
+    # Each value is a list of scalars — one float per collection point.
+    state_norm_trace: Optional[Dict[str, List[float]]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +192,7 @@ class CoralCore(nn.Module):
         attention_bias: Optional[torch.Tensor] = None,
         input_injection: Optional[torch.Tensor] = None,
         _states_collector: Optional[List[torch.Tensor]] = None,
+        _norm_collector: Optional[Dict[str, List[float]]] = None,
     ) -> torch.Tensor:
         """Run backbone recursion for one level.
 
@@ -259,12 +264,26 @@ class CoralCore(nn.Module):
             backbone_in = backbone_in + self.level_emb(level_idx, device).unsqueeze(0).unsqueeze(0)
             backbone_in = backbone_in + self.timescale_emb(t).unsqueeze(0).unsqueeze(0)
             if inject and input_injection is not None:
+                # Record backbone-input norm before and after injection (backbone_dim space).
+                if _norm_collector is not None:
+                    _norm_collector["pre_injection"].append(
+                        backbone_in.detach().float().norm(dim=-1).mean().item()
+                    )
                 backbone_in = backbone_in + input_injection
+                if _norm_collector is not None:
+                    _norm_collector["post_injection"].append(
+                        backbone_in.detach().float().norm(dim=-1).mean().item()
+                    )
             z_new = level_mod.project_down(
                 self.backbone(backbone_in, attention_bias=attention_bias)
             )
             if conditioning is not None:
-                return z_new + self.cond_gate[level_idx] * (conditioning - z_in)
+                z_new = z_new + self.cond_gate[level_idx] * (conditioning - z_in)
+            # Record level-state norm after this inner step (d_l space, includes conditioning).
+            if _norm_collector is not None:
+                _norm_collector["post_backbone"].append(
+                    z_new.detach().float().norm(dim=-1).mean().item()
+                )
             return z_new
 
         # Warmup steps: state converges; no activations stored for backward.
@@ -302,6 +321,7 @@ class CoralCore(nn.Module):
         decode_fn: Optional[callable] = None,
         attention_masks: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         collect_inner_step_states: bool = False,
+        collect_state_norms: bool = False,
     ) -> CoralOutput:
         """Run the full reasoning loop.
 
@@ -380,6 +400,18 @@ class CoralCore(nn.Module):
         # learning signal from all K_max segments, not just the first.
         input_signal: Optional[torch.Tensor] = z1_init
 
+        # Initialise norm trace (None when collect_state_norms=False — zero overhead).
+        _norm_trace: Optional[Dict[str, List[float]]] = None
+        if collect_state_norms:
+            _norm_trace = {
+                "z1_init": [z1_init.detach().float().norm(dim=-1).mean().item()],
+                "pre_injection": [],
+                "post_injection": [],
+                "post_backbone": [],
+                "segment_end": [],
+                "post_detach": [],
+            }
+
         output = CoralOutput()
 
         for seg in range(K_max):
@@ -414,6 +446,7 @@ class CoralCore(nn.Module):
                         attention_bias=attn_bias,
                         input_injection=input_signal if i == 0 else None,
                         _states_collector=_inner_collector if i == 0 else None,
+                        _norm_collector=_norm_trace if i == 0 else None,
                     )
 
             else:
@@ -463,6 +496,7 @@ class CoralCore(nn.Module):
                         z_states[i], i, n_steps, conditioning=cond, attention_bias=attn_bias,
                         input_injection=input_signal,
                         _states_collector=_inner_collector if i == 0 else None,
+                        _norm_collector=_norm_trace if i == 0 else None,
                     )
 
                     # Compute precision-weighted error and project upward
@@ -487,6 +521,12 @@ class CoralCore(nn.Module):
             # Store inner-step states from the final segment (diagnostic only).
             if _inner_collector is not None:
                 output.last_segment_inner_states = _inner_collector
+
+            # Record level-0 norm at the end of this segment (before detach).
+            if _norm_trace is not None:
+                _norm_trace["segment_end"].append(
+                    z_states[0].detach().float().norm(dim=-1).mean().item()
+                )
 
             # ----------------------------------------------------------------
             # Crystallisation losses (accumulated once per segment).
@@ -553,5 +593,12 @@ class CoralCore(nn.Module):
             # ----------------------------------------------------------------
             z_states = [z.detach() for z in z_states]
 
+            # Record level-0 norm immediately after detach (should equal segment_end).
+            if _norm_trace is not None:
+                _norm_trace["post_detach"].append(
+                    z_states[0].float().norm(dim=-1).mean().item()
+                )
+
         output.z_states = z_states
+        output.state_norm_trace = _norm_trace
         return output
