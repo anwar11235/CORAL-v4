@@ -30,6 +30,38 @@ def _bucket_key(n_empty: int) -> str:
             return key
 
 
+def compute_precision_recall_at_5(
+    preds: torch.Tensor,
+    labels: torch.Tensor,
+    token: int = 5,
+) -> Tuple[float, float]:
+    """Compute precision and recall for a specific token, aggregated over all positions.
+
+    Counts are summed flat over B×L (not per-sample averaged) so that each cell
+    contributes equally regardless of how many path cells a particular maze has.
+
+    Args:
+        preds:  [B, L] predicted token ids.
+        labels: [B, L] ground-truth token ids.
+        token:  The positive-class token. Default 5 (optimal-path in Maze-Hard).
+
+    Returns:
+        (precision, recall) as Python floats. Returns (0.0, 0.0) when the model
+        never predicts the token (precision) or no ground-truth positives exist
+        (recall), to avoid NaN.
+    """
+    pred_pos = preds == token
+    label_pos = labels == token
+
+    tp = int((pred_pos & label_pos).sum().item())
+    fp = int((pred_pos & ~label_pos).sum().item())
+    fn = int((~pred_pos & label_pos).sum().item())
+
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    return precision, recall
+
+
 def _summarize_norm_trace(
     trace: Dict[str, List[float]],
 ) -> Dict[str, float]:
@@ -132,6 +164,9 @@ def evaluate_accuracy(
     wall_total = 0
     non_path_correct = 0
     non_path_total = 0
+    tp_5 = 0   # predicted 5 AND label 5
+    fp_5 = 0   # predicted 5 AND label != 5
+    fn_5 = 0   # predicted != 5 AND label 5
 
     # Per-bucket accumulators: puzzles, token correct/total, empty correct/total, exact correct.
     bucket_acc: Dict[str, Dict[str, int]] = {
@@ -167,6 +202,9 @@ def evaluate_accuracy(
         seg_path_tot_d: Dict[int, int] = {s: 0 for s in seg_checkpoints}
         seg_exact_corr: Dict[int, int] = {s: 0 for s in seg_checkpoints}
         seg_exact_tot_d: Dict[int, int] = {s: 0 for s in seg_checkpoints}
+        seg_tp_5: Dict[int, int] = {s: 0 for s in seg_checkpoints}
+        seg_fp_5: Dict[int, int] = {s: 0 for s in seg_checkpoints}
+        seg_fn_5: Dict[int, int] = {s: 0 for s in seg_checkpoints}
         inner_step_delta_accum: List[List[float]] = []
 
     # State norm trace: collected from the very first batch only (diagnostic, low overhead).
@@ -222,6 +260,10 @@ def evaluate_accuracy(
                 wall_total += wall_mask.sum().item()
                 non_path_correct += (correct & non_path_mask & mask).sum().item()
                 non_path_total += (non_path_mask & mask).sum().item()
+                pred_5 = (preds == 5)
+                tp_5 += int((pred_5 & path_mask).sum().item())
+                fp_5 += int((pred_5 & ~path_mask).sum().item())
+                fn_5 += int((~pred_5 & path_mask).sum().item())
 
             # Per-segment + velocity accumulators (maze, full-depth only).
             if collect_maze_diag:
@@ -234,6 +276,10 @@ def evaluate_accuracy(
                         seg_path_tot_d[seg_idx] += pm.sum().item()
                         seg_exact_corr[seg_idx] += (sp == labels).all(dim=-1).sum().item()
                         seg_exact_tot_d[seg_idx] += B
+                        sp_5 = (sp == 5)
+                        seg_tp_5[seg_idx] += int((sp_5 & pm).sum().item())
+                        seg_fp_5[seg_idx] += int((sp_5 & ~pm).sum().item())
+                        seg_fn_5[seg_idx] += int((~sp_5 & pm).sum().item())
 
                 if (output.last_segment_inner_states is not None
                         and len(output.last_segment_inner_states) >= 2):
@@ -275,8 +321,10 @@ def evaluate_accuracy(
             "eval/wall_accuracy": wall_correct / max(wall_total, 1),
             "eval/non_path_accuracy": non_path_correct / max(non_path_total, 1),
             "eval/avg_halting_step": avg_halt,
+            "eval/precision_at_5": tp_5 / max(tp_5 + fp_5, 1),
+            "eval/recall_at_5": tp_5 / max(tp_5 + fn_5, 1),
         }
-        # Per-segment path accuracy and exact accuracy.
+        # Per-segment path accuracy, exact accuracy, and precision/recall@5.
         if collect_maze_diag:
             for seg_idx in seg_checkpoints:
                 maze_metrics[f"eval/seg_{seg_idx}_path_accuracy"] = (
@@ -284,6 +332,12 @@ def evaluate_accuracy(
                 )
                 maze_metrics[f"eval/seg_{seg_idx}_exact_accuracy"] = (
                     seg_exact_corr[seg_idx] / max(seg_exact_tot_d[seg_idx], 1)
+                )
+                maze_metrics[f"eval/seg_{seg_idx}_precision_at_5"] = (
+                    seg_tp_5[seg_idx] / max(seg_tp_5[seg_idx] + seg_fp_5[seg_idx], 1)
+                )
+                maze_metrics[f"eval/seg_{seg_idx}_recall_at_5"] = (
+                    seg_tp_5[seg_idx] / max(seg_tp_5[seg_idx] + seg_fn_5[seg_idx], 1)
                 )
             # Inner-step velocity statistics.
             if inner_step_delta_accum:

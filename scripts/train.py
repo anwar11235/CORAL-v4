@@ -23,6 +23,7 @@ import hydra
 import numpy as np
 import torch
 import wandb
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 # Add repo root to path
@@ -74,6 +75,7 @@ def main(cfg: DictConfig) -> None:
     seed_everything(config.seed)
 
     log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
+    output_dir = HydraConfig.get().runtime.output_dir
 
     # ---- W&B initialisation ----
     wandb_run = None
@@ -223,6 +225,7 @@ def main(cfg: DictConfig) -> None:
                     f"[QUICK EVAL] step={step} | "
                     + " | ".join(f"{k}={v:.4f}" for k, v in quick_metrics.items())
                 )
+                _save_checkpoint(trainer, cfg, step, output_dir)
 
             # Full Pareto eval — all puzzles, K=1..16
             if step % config.training.pareto_eval_every == 0:
@@ -251,8 +254,27 @@ def main(cfg: DictConfig) -> None:
             break
 
     log.info("Training complete.")
+    _save_checkpoint(trainer, cfg, step, output_dir)
     if wandb_run is not None:
         wandb_run.finish()
+
+
+def _save_checkpoint(trainer: "TrainerV4", cfg: DictConfig, step: int, output_dir: str) -> None:
+    """Overwrite last.pt with current model, optimizer, step, and config."""
+    ckpt_path = os.path.join(output_dir, "last.pt")
+    torch.save(
+        {
+            "model_state_dict": {
+                "adapter": trainer.adapter.state_dict(),
+                "core": trainer.core.state_dict(),
+            },
+            "optimizer_state_dict": trainer.optimizer.state_dict(),
+            "step": step,
+            "config": OmegaConf.to_container(cfg, resolve=True),
+        },
+        ckpt_path,
+    )
+    log.info(f"Checkpoint saved → {ckpt_path}")
 
 
 def _log_precision_metrics(trainer, eval_loader, device, out_dict):
