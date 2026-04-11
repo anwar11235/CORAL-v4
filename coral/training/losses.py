@@ -121,11 +121,13 @@ class CoralLoss(nn.Module):
 
     Args:
         config: Model configuration with lambda weights and flags.
+        dataset_name: Dataset identifier used to gate maze-specific masking.
     """
 
-    def __init__(self, config: ModelConfig) -> None:
+    def __init__(self, config: ModelConfig, dataset_name: str = "") -> None:
         super().__init__()
         self.config = config
+        self.dataset_name = dataset_name
 
     def forward(
         self,
@@ -138,6 +140,7 @@ class CoralLoss(nn.Module):
         all_pred_errors: Optional[List[Dict[str, torch.Tensor]]] = None,
         commitment_loss: Optional[torch.Tensor] = None,
         disentanglement_loss: Optional[torch.Tensor] = None,
+        inputs: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute total loss and breakdown.
 
@@ -150,6 +153,8 @@ class CoralLoss(nn.Module):
             q_continue_logits:  [B] Q-continue logits for halting loss
             all_pred_errors:    List of pred_error dicts across all segments
                                 (for amortisation loss)
+            inputs:             [B, L] — raw input tokens; used for maze masking
+                                (only consulted when dataset_name=="maze_30x30_hard")
 
         Returns:
             (total_loss, breakdown_dict) where breakdown contains all
@@ -160,10 +165,21 @@ class CoralLoss(nn.Module):
 
         # ---- Task loss (always active, float64) ----
         mask = labels != IGNORE_LABEL_ID
-        loss_counts = mask.sum(-1).clamp_min(1).float()  # [B]
         per_token = stablemax_cross_entropy(logits, labels)  # [B, L]
-        # Per-sequence mean, then sum over batch
-        L_task = (per_token.sum(-1).float() / loss_counts).mean()
+
+        if self.dataset_name == "maze_30x30_hard" and inputs is not None:
+            # Mask to cells where the input differs from the label — the only
+            # cells that require genuine prediction (not copy-the-input).
+            # ~880/900 maze cells are trivially predicted; without this mask
+            # those dominate the gradient and the model collapses to copying.
+            nontrivial = (inputs != labels) & mask  # [B, L]
+            n_masked = nontrivial.sum(-1).float().clamp_min(1)  # [B]
+            L_task = ((per_token * nontrivial.float()).sum(-1).float() / n_masked).mean()
+            breakdown["loss/task_masked_cells_mean"] = nontrivial.sum(-1).float().mean()
+        else:
+            loss_counts = mask.sum(-1).clamp_min(1).float()  # [B]
+            L_task = (per_token.sum(-1).float() / loss_counts).mean()
+
         breakdown["loss/task"] = L_task.float()
 
         # ---- Predictive coding loss ----

@@ -348,6 +348,109 @@ def test_end_to_end_full_mode_loss_no_nan():
 # Deep supervision segment weighting (Fix 3 — Session 10)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Maze masked task loss (Session C)
+# ---------------------------------------------------------------------------
+
+def test_maze_masked_loss_ignores_trivial_cells():
+    """Masked maze loss equals log(V) when non-trivial logits are uniform.
+
+    With zero logits (uniform stablemax distribution over V classes), the
+    per-token stablemax CE for a non-trivial cell is log(V).  The masked
+    loss must equal log(V) exactly — NOT log(V) * (n_nontrivial / L).
+    """
+    import math
+
+    V = 6  # maze vocab size
+    config = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=2, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=V, mode="baseline",
+    )
+    loss_fn = CoralLoss(config, dataset_name="maze_30x30_hard")
+
+    B, L = 2, 9
+    inputs = torch.tensor([
+        [1, 2, 1, 2, 3, 1, 1, 4, 1],
+        [1, 1, 2, 1, 4, 1, 2, 3, 1],
+    ])
+    labels = torch.tensor([
+        [1, 2, 5, 2, 3, 5, 1, 4, 1],
+        [1, 5, 2, 5, 4, 1, 2, 3, 5],
+    ])
+    # Non-trivial positions: row0=[2,5], row1=[1,3,8] → counts [2, 3]
+    expected_masked_cells_mean = (2 + 3) / 2.0  # 2.5
+
+    # Zero logits → uniform stablemax → per-token CE = log(V)
+    logits = torch.zeros(B, L, V)
+    expected_loss = math.log(V)
+
+    total, breakdown = loss_fn(logits=logits, labels=labels, inputs=inputs)
+
+    assert breakdown["loss/task"].item() == pytest.approx(expected_loss, rel=1e-5), (
+        f"Masked maze loss should equal log(V)={expected_loss:.6f}, "
+        f"got {breakdown['loss/task'].item():.6f}"
+    )
+    assert breakdown["loss/task_masked_cells_mean"].item() == pytest.approx(
+        expected_masked_cells_mean, abs=1e-5
+    ), (
+        f"task_masked_cells_mean should be {expected_masked_cells_mean}, "
+        f"got {breakdown['loss/task_masked_cells_mean'].item()}"
+    )
+
+
+def test_sudoku_loss_unchanged():
+    """Sudoku (non-maze) task loss must be identical regardless of whether inputs is passed."""
+    config = _baseline_config()
+    loss_fn_default = CoralLoss(config)  # dataset_name="" → standard path
+    loss_fn_sudoku = CoralLoss(config, dataset_name="sudoku_extreme_1k")
+
+    torch.manual_seed(42)
+    logits, labels = _make_fake_logits_labels(B=2, L=9, vocab=10)
+    inputs = torch.randint(1, 10, (2, 9))  # would be used only for maze
+
+    _, bd_default = loss_fn_default(logits=logits, labels=labels, inputs=inputs)
+    _, bd_sudoku = loss_fn_sudoku(logits=logits, labels=labels, inputs=inputs)
+
+    # Task loss must be bit-identical — Sudoku path is untouched
+    assert bd_default["loss/task"].item() == pytest.approx(
+        bd_sudoku["loss/task"].item(), abs=0.0
+    ), "Sudoku task loss must be bit-identical whether dataset_name is '' or 'sudoku_extreme_1k'"
+
+    # Masked-cells key must NOT appear for non-maze datasets
+    assert "loss/task_masked_cells_mean" not in bd_default
+    assert "loss/task_masked_cells_mean" not in bd_sudoku
+
+
+def test_maze_mask_empty_batch_guard():
+    """When inputs == labels everywhere, masked loss must be finite, zero, and backward-safe."""
+    V = 6
+    config = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=2, K_max=2,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=V, mode="baseline",
+    )
+    loss_fn = CoralLoss(config, dataset_name="maze_30x30_hard")
+
+    B, L = 2, 9
+    labels = torch.randint(1, V, (B, L))
+    inputs = labels.clone()  # all trivial — mask is all-False
+    logits = torch.randn(B, L, V, requires_grad=True)
+
+    total, breakdown = loss_fn(logits=logits, labels=labels, inputs=inputs)
+
+    assert total.isfinite(), "Empty-mask loss must be finite"
+    assert total.item() == pytest.approx(0.0, abs=1e-6), (
+        f"Empty-mask loss must be zero, got {total.item()}"
+    )
+    # backward must not crash
+    total.backward()
+
+
 def test_linear_weighting_differs_from_uniform():
     """Linear deep supervision weighting must produce different gradients from uniform.
 

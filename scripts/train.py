@@ -116,7 +116,7 @@ def main(cfg: DictConfig) -> None:
         grid_width=config.data.grid_width,
     )
     core = CoralCore(config.model)
-    loss_fn = CoralLoss(config.model)
+    loss_fn = CoralLoss(config.model, dataset_name=config.data.dataset)
 
     total_params = sum(p.numel() for p in adapter.parameters()) + \
                    sum(p.numel() for p in core.parameters())

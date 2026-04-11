@@ -126,6 +126,7 @@ class TrainerV4:
                     all_pred_errors=output.pred_errors if i == len(output.all_logits) - 1 else None,
                     commitment_loss=output.commit_losses[i] if output.commit_losses else None,
                     disentanglement_loss=output.dis_losses[i] if output.dis_losses else None,
+                    inputs=inputs,
                 )
                 if weighting == "linear":
                     # weight_i = (i+1) / num_segs, normalised so sum == num_segs
