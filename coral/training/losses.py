@@ -153,7 +153,7 @@ class CoralLoss(nn.Module):
             q_continue_logits:  [B] Q-continue logits for halting loss
             all_pred_errors:    List of pred_error dicts across all segments
                                 (for amortisation loss)
-            inputs:             [B, L] — raw input tokens; used for maze masking
+            inputs:             [B, L] — raw input tokens; used for maze weighted loss
                                 (only consulted when dataset_name=="maze_30x30_hard")
 
         Returns:
@@ -168,14 +168,16 @@ class CoralLoss(nn.Module):
         per_token = stablemax_cross_entropy(logits, labels)  # [B, L]
 
         if self.dataset_name == "maze_30x30_hard" and inputs is not None:
-            # Mask to cells where the input differs from the label — the only
-            # cells that require genuine prediction (not copy-the-input).
-            # ~880/900 maze cells are trivially predicted; without this mask
-            # those dominate the gradient and the model collapses to copying.
+            # Upweight non-trivial cells (input != label) by alpha.
+            # All 900 cells contribute gradient so position-awareness is preserved,
+            # but the ~113 path cells dominate the learning signal.
+            alpha = getattr(self.config, "maze_path_loss_weight", 40.0)
             nontrivial = (inputs != labels) & mask  # [B, L]
-            n_masked = nontrivial.sum(-1).float().clamp_min(1)  # [B]
-            L_task = ((per_token * nontrivial.float()).sum(-1).float() / n_masked).mean()
-            breakdown["loss/task_masked_cells_mean"] = nontrivial.sum(-1).float().mean()
+            weights = mask.float()                  # 0 for IGNORE, 1 for valid trivial
+            weights[nontrivial] = alpha             # alpha for valid non-trivial
+            denom = weights.sum(-1).clamp_min(1.0)  # [B]
+            L_task = ((per_token * weights).sum(-1).float() / denom).mean()
+            breakdown["loss/task_weighted_cells_mean"] = nontrivial.sum(-1).float().mean()
         else:
             loss_counts = mask.sum(-1).clamp_min(1).float()  # [B]
             L_task = (per_token.sum(-1).float() / loss_counts).mean()

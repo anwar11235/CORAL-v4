@@ -58,6 +58,7 @@ class ModelConfig:
     # v4.2 additions: losses and precision
     lambda_dis: float = 0.01         # disentanglement loss weight
     precision_momentum: float = 0.99  # EMA momentum for running-statistics precision
+    maze_path_loss_weight: float = 40.0  # alpha: upweight factor for non-trivial cells in maze task loss
 
     # v4.2 additions: attention and mode
     # Default False for backward compat: existing configs/tests that omit this field

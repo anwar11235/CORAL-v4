@@ -349,26 +349,40 @@ def test_end_to_end_full_mode_loss_no_nan():
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Maze masked task loss (Session C)
+# Maze weighted task loss (Session F — replaces Session C masked loss)
 # ---------------------------------------------------------------------------
 
-def test_maze_masked_loss_ignores_trivial_cells():
-    """Masked maze loss equals log(V) when non-trivial logits are uniform.
-
-    With zero logits (uniform stablemax distribution over V classes), the
-    per-token stablemax CE for a non-trivial cell is log(V).  The masked
-    loss must equal log(V) exactly — NOT log(V) * (n_nontrivial / L).
-    """
-    import math
-
-    V = 6  # maze vocab size
-    config = ModelConfig(
+def _maze_loss_config(alpha: float = 40.0):
+    """Helper: minimal ModelConfig for maze weighted-loss tests."""
+    return ModelConfig(
         n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
         ffn_expansion=2, timescale_base=2, K_max=2,
         use_predictive_coding=False, use_crystallisation=False,
         use_amort=False, lambda_amort=0.0,
-        epsilon_min=0.01, lambda_pred=0.001, vocab_size=V, mode="baseline",
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=6, mode="baseline",
+        maze_path_loss_weight=alpha,
     )
+
+
+def test_maze_weighted_loss_upweights_nontrivial_cells():
+    """Weighted maze loss matches analytic formula.
+
+    Non-trivial cells: trivial have CE≈0 (large true-class logit);
+    non-trivial have CE=log(V) (zero logits, uniform distribution).
+
+    Expected per-sequence loss:
+        alpha * log(V) * n_nontrivial / (n_nontrivial * alpha + n_trivial)
+
+    With alpha=10, V=6, batch:
+      row0: 2 non-trivial, 7 trivial → 10*log(6)*2/(20+7) = 20*log(6)/27
+      row1: 3 non-trivial, 6 trivial → 10*log(6)*3/(30+6) = 30*log(6)/36
+    Batch mean = (20*log(6)/27 + 30*log(6)/36) / 2
+    """
+    import math
+
+    alpha = 10.0
+    V = 6
+    config = _maze_loss_config(alpha=alpha)
     loss_fn = CoralLoss(config, dataset_name="maze_30x30_hard")
 
     B, L = 2, 9
@@ -380,25 +394,38 @@ def test_maze_masked_loss_ignores_trivial_cells():
         [1, 2, 5, 2, 3, 5, 1, 4, 1],
         [1, 5, 2, 5, 4, 1, 2, 3, 5],
     ])
-    # Non-trivial positions: row0=[2,5], row1=[1,3,8] → counts [2, 3]
-    expected_masked_cells_mean = (2 + 3) / 2.0  # 2.5
+    # Non-trivial positions: row0=[2,5] (2 cells), row1=[1,3,8] (3 cells)
 
-    # Zero logits → uniform stablemax → per-token CE = log(V)
+    # Build logits: large true-class logit for trivial cells (CE≈0),
+    # all-zero for non-trivial cells (CE=log(V)).
     logits = torch.zeros(B, L, V)
-    expected_loss = math.log(V)
+    trivial = (inputs == labels)
+    for b in range(B):
+        for l_idx in range(L):
+            if trivial[b, l_idx]:
+                logits[b, l_idx, labels[b, l_idx].item()] = 1e10
+
+    # Analytic expected loss (per-sequence then batch mean)
+    n_nt = [2, 3]
+    n_tr = [7, 6]
+    log_V = math.log(V)  # stablemax CE for uniform is natural log(V)
+    seq_losses = [
+        alpha * log_V * n_nt[i] / (n_nt[i] * alpha + n_tr[i])
+        for i in range(B)
+    ]
+    expected_loss = sum(seq_losses) / B
 
     total, breakdown = loss_fn(logits=logits, labels=labels, inputs=inputs)
 
-    assert breakdown["loss/task"].item() == pytest.approx(expected_loss, rel=1e-5), (
-        f"Masked maze loss should equal log(V)={expected_loss:.6f}, "
+    assert breakdown["loss/task"].item() == pytest.approx(expected_loss, rel=1e-3), (
+        f"Weighted maze loss should be {expected_loss:.6f}, "
         f"got {breakdown['loss/task'].item():.6f}"
     )
-    assert breakdown["loss/task_masked_cells_mean"].item() == pytest.approx(
-        expected_masked_cells_mean, abs=1e-5
-    ), (
-        f"task_masked_cells_mean should be {expected_masked_cells_mean}, "
-        f"got {breakdown['loss/task_masked_cells_mean'].item()}"
-    )
+    assert breakdown["loss/task_weighted_cells_mean"].item() == pytest.approx(
+        (2 + 3) / 2.0, abs=1e-5
+    ), "task_weighted_cells_mean should be 2.5"
+    # Old masked-cells key must be gone
+    assert "loss/task_masked_cells_mean" not in breakdown
 
 
 def test_sudoku_loss_unchanged():
@@ -419,33 +446,38 @@ def test_sudoku_loss_unchanged():
         bd_sudoku["loss/task"].item(), abs=0.0
     ), "Sudoku task loss must be bit-identical whether dataset_name is '' or 'sudoku_extreme_1k'"
 
-    # Masked-cells key must NOT appear for non-maze datasets
-    assert "loss/task_masked_cells_mean" not in bd_default
-    assert "loss/task_masked_cells_mean" not in bd_sudoku
+    # Weighted-cells key must NOT appear for non-maze datasets
+    assert "loss/task_weighted_cells_mean" not in bd_default
+    assert "loss/task_weighted_cells_mean" not in bd_sudoku
 
 
-def test_maze_mask_empty_batch_guard():
-    """When inputs == labels everywhere, masked loss must be finite, zero, and backward-safe."""
+def test_maze_weighted_loss_empty_mask_guard():
+    """When inputs == labels everywhere (all trivial), weighted loss equals ordinary mean CE.
+
+    All weights are 1 → the weighted loss degenerates to the standard
+    mean-reduced cross-entropy. Must be finite and backward-safe.
+    """
     V = 6
-    config = ModelConfig(
-        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
-        ffn_expansion=2, timescale_base=2, K_max=2,
-        use_predictive_coding=False, use_crystallisation=False,
-        use_amort=False, lambda_amort=0.0,
-        epsilon_min=0.01, lambda_pred=0.001, vocab_size=V, mode="baseline",
-    )
+    config = _maze_loss_config(alpha=40.0)
     loss_fn = CoralLoss(config, dataset_name="maze_30x30_hard")
 
     B, L = 2, 9
     labels = torch.randint(1, V, (B, L))
-    inputs = labels.clone()  # all trivial — mask is all-False
+    inputs = labels.clone()  # all trivial — no upweighting
     logits = torch.randn(B, L, V, requires_grad=True)
 
     total, breakdown = loss_fn(logits=logits, labels=labels, inputs=inputs)
 
-    assert total.isfinite(), "Empty-mask loss must be finite"
-    assert total.item() == pytest.approx(0.0, abs=1e-6), (
-        f"Empty-mask loss must be zero, got {total.item()}"
+    # With all weights=1 the result should equal the standard mean CE
+    # (per-sequence mean over valid cells, then batch mean).
+    from coral.training.losses import stablemax_cross_entropy
+    per_tok = stablemax_cross_entropy(logits.detach(), labels)
+    n_valid = (labels != -100).sum(-1).float().clamp_min(1)
+    expected = (per_tok.sum(-1).float() / n_valid).mean()
+
+    assert total.isfinite(), "All-trivial weighted loss must be finite"
+    assert total.item() == pytest.approx(expected.item(), rel=1e-5), (
+        "When all cells are trivial the weighted loss must equal ordinary mean CE"
     )
     # backward must not crash
     total.backward()
