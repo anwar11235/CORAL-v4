@@ -47,6 +47,7 @@ class SudokuDatasetMetadata:
         total_groups: int = 1000,
         mean_puzzle_examples: float = 1000.0,
         sets: Optional[List[str]] = None,
+        **_kwargs,
     ):
         self.pad_id = pad_id
         self.ignore_label_id = ignore_label_id
