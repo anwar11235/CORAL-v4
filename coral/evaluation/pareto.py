@@ -90,6 +90,7 @@ def evaluate_pareto(
             results[f"eval/pareto_k{K}_token_accuracy"] = metrics.get("eval/token_accuracy", 0.0)
         else:
             results[f"eval/accuracy@K{K}"] = metrics["eval/exact_accuracy"]
+            results[f"eval/token_accuracy@K{K}"] = metrics["eval/token_accuracy"]
 
     # Full-depth evaluation (adaptive halting, K_override=None).
     # collect_diagnostics=False: per-segment states, velocity, and repr are for
@@ -126,6 +127,10 @@ def evaluate_pareto(
             # Simple mean exact accuracy (comparable scalar with maze).
             exact_accs = [results[f"eval/accuracy@K{K}"] for K in valid_Ks]
             results["eval/pareto_area_exact_accuracy"] = sum(exact_accs) / len(exact_accs)
+            # Mean token accuracy across K values — non-saturated signal on
+            # early-training runs where exact accuracy is 0 for all K.
+            token_accs = [results[f"eval/token_accuracy@K{K}"] for K in valid_Ks]
+            results["eval/pareto_area_token_accuracy"] = sum(token_accs) / len(token_accs)
 
     return results
 

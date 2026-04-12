@@ -367,6 +367,64 @@ def test_evaluate_pareto_preserves_sudoku_metrics():
 
 
 # ---------------------------------------------------------------------------
+# Test 8b: evaluate_pareto emits token_accuracy@K for each Sudoku K value
+# ---------------------------------------------------------------------------
+
+def test_evaluate_pareto_emits_token_accuracy_per_k():
+    """For every K in the Pareto sweep, token_accuracy@K must be present and in [0,1].
+
+    Regression for Session M2: exact accuracy is 0 on non-saturated configs,
+    making K-dependence invisible. token_accuracy@K gives a non-saturated signal.
+    """
+    from coral.evaluation.pareto import evaluate_pareto
+    from torch.utils.data import DataLoader, Dataset
+
+    model_cfg = ModelConfig(
+        n_levels=1, level_dims=[64], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=3, K_max=4,
+        use_predictive_coding=False, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=11, mode="baseline",
+        inner_steps_override=2,
+    )
+    cfg = CoralConfig(model=model_cfg, device="cpu")
+    adapter = GridAdapter(cfg, vocab_size=11, grid_height=9, grid_width=9)
+    core = CoralCore(model_cfg)
+
+    class TinySudoku(Dataset):
+        def __len__(self): return 4
+        def __getitem__(self, i):
+            inp = torch.randint(1, 11, (81,), dtype=torch.long)
+            lbl = torch.randint(2, 11, (81,), dtype=torch.long)
+            return {"inputs": inp, "labels": lbl}
+
+    loader = DataLoader(TinySudoku(), batch_size=2)
+    k_values = [1, 2, 4]
+    metrics = evaluate_pareto(
+        adapter=adapter, core=core, dataloader=loader,
+        device=torch.device("cpu"), dtype=torch.float32,
+        K_values=k_values,
+    )
+
+    for K in k_values:
+        key = f"eval/token_accuracy@K{K}"
+        assert key in metrics, (
+            f"Missing {key}. Got keys: {[k for k in metrics if 'token' in k]}"
+        )
+        val = metrics[key]
+        assert isinstance(val, float), f"{key} should be float, got {type(val)}"
+        assert 0.0 <= val <= 1.0, f"{key}={val} outside [0, 1]"
+        # Paired: accuracy@K must also be present for every K with token_accuracy@K
+        assert f"eval/accuracy@K{K}" in metrics, (
+            f"eval/accuracy@K{K} missing alongside token_accuracy@K{K}"
+        )
+
+    # Area scalar must be present and in [0, 1]
+    assert "eval/pareto_area_token_accuracy" in metrics
+    assert 0.0 <= metrics["eval/pareto_area_token_accuracy"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
 # Test 9: CoralCore collects inner-step states from the final segment
 # ---------------------------------------------------------------------------
 
