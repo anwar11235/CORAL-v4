@@ -259,6 +259,12 @@ class TrainerV4:
             bypass_exact = (bypass_correct.sum(-1) == mask.sum(-1))
             metrics["crystal/bypass_accuracy"] = bypass_exact.float().mean().item()
 
+        # Conditioning gate values — one scalar per hierarchy level.
+        # Emitted unconditionally so gate evolution is visible in every eval
+        # log line regardless of whether Pareto eval has run yet.
+        for i, gate in enumerate(self.core.cond_gate):
+            metrics[f"cond_gate/level{i}"] = gate.item()
+
         return metrics
 
     @torch.no_grad()

@@ -219,6 +219,9 @@ def main(cfg: DictConfig) -> None:
                     max_puzzles=config.training.quick_eval_samples,
                     dataset_name=config.data.dataset,
                 )
+                # Surface conditioning-gate evolution in every quick-eval log line.
+                for i, gate in enumerate(trainer.core.cond_gate):
+                    quick_metrics[f"cond_gate/level{i}"] = gate.item()
                 if wandb_run is not None:
                     wandb_run.log(quick_metrics, step=step)
                 log.info(

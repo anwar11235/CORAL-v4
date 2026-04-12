@@ -102,6 +102,47 @@ def test_loss_total_greater_than_last_seg_for_multiple_segments():
 # Regression: ensure the old collision no longer occurs
 # ---------------------------------------------------------------------------
 
+def test_eval_step_emits_cond_gate_for_each_level():
+    """eval_step must include cond_gate/level{i} for every hierarchy level.
+
+    Regression for Session M1: cond_gate was only logged during Pareto eval
+    (pareto_eval_every=5000), so it never appeared in quick-eval log lines.
+    """
+    # N=2, PC enabled so both cond_gate[0] and cond_gate[1] exist on the core.
+    config = ModelConfig(
+        n_levels=2, level_dims=[64, 32], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=2, K_max=2,
+        use_predictive_coding=True, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=10, mode="baseline",
+    )
+    coral_config = CoralConfig(model=config, device="cpu")
+    coral_config.training.precision = "float32"
+    coral_config.training.gradient_clip = 1.0
+
+    adapter = GridAdapter(coral_config, vocab_size=10, grid_height=3, grid_width=3)
+    core = CoralCore(config)
+    loss_fn = CoralLoss(config)
+    trainer = TrainerV4(adapter, core, loss_fn, coral_config)
+
+    batch = {
+        "inputs": torch.randint(0, 10, (2, 9)),
+        "labels": torch.randint(1, 10, (2, 9)),
+    }
+    metrics = trainer.eval_step(batch)
+
+    assert "cond_gate/level0" in metrics, (
+        "eval_step must emit cond_gate/level0; "
+        "check TrainerV4.eval_step for the cond_gate loop"
+    )
+    assert "cond_gate/level1" in metrics, (
+        "eval_step must emit cond_gate/level1 for N=2 models"
+    )
+    # Values should be close to the init of 0.01 (unchanged by a no-grad eval pass)
+    assert isinstance(metrics["cond_gate/level0"], float)
+    assert isinstance(metrics["cond_gate/level1"], float)
+
+
 def test_loss_total_is_not_overwritten_by_breakdown():
     """The sum over segments must not be replaced by a single-segment value.
 
