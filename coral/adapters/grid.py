@@ -5,7 +5,9 @@ back to per-cell token logits.
 
 Encoding:
   - Token embedding: vocab_size → d_model
-  - 2D positional embedding: row_emb + col_emb (both learned)
+  - Full 2D positional embedding: one learned vector per (row, col) pair,
+    pos_emb[H*W, d_model]. Rank ceiling = min(H*W, d_model), vs H+W for
+    the old factorized (row+col) additive scheme.
   - Optional embed_scale: multiply by sqrt(d_model) before layer norm so the
     input signal maintains appropriate magnitude relative to the residual stream
     during deep recurrence (standard LLM practice; matches TRM's embed_scale).
@@ -14,6 +16,7 @@ Decoding:
   - Linear: d_1 → vocab_size
 
 For Sudoku: seq_len=81, vocab_size=11, grid is 9×9.
+For Maze:   seq_len=900, vocab_size=6, grid is 30×30.
 """
 
 import math
@@ -54,9 +57,9 @@ class GridAdapter(BaseAdapter):
         # Token embedding
         self.token_emb = nn.Embedding(self.vocab_size, self.d_model)
 
-        # 2D positional embeddings (learned)
-        self.row_emb = nn.Embedding(grid_height, self.d_model)
-        self.col_emb = nn.Embedding(grid_width, self.d_model)
+        # Full joint 2D positional embedding: one vector per (row, col) pair.
+        # Rank ceiling = min(H*W, d_model) instead of H+W for factorized row+col.
+        self.pos_emb = nn.Embedding(grid_height * grid_width, self.d_model)
 
         # Layer norm for stable input to core
         self.input_norm = nn.LayerNorm(self.d_model)
@@ -66,16 +69,18 @@ class GridAdapter(BaseAdapter):
 
         self._init_weights()
 
-        # Register position index buffers
+        # Register position index buffers.
+        # row_indices and col_indices are kept for build_attention_masks.
+        # pos_indices = row * grid_width + col is the flat 2D lookup index.
         rows = torch.arange(grid_height).unsqueeze(1).expand(grid_height, grid_width).reshape(-1)
         cols = torch.arange(grid_width).unsqueeze(0).expand(grid_height, grid_width).reshape(-1)
         self.register_buffer("row_indices", rows, persistent=True)
         self.register_buffer("col_indices", cols, persistent=True)
+        self.register_buffer("pos_indices", rows * grid_width + cols, persistent=True)
 
     def _init_weights(self) -> None:
         nn.init.normal_(self.token_emb.weight, std=0.02)
-        nn.init.normal_(self.row_emb.weight, std=0.02)
-        nn.init.normal_(self.col_emb.weight, std=0.02)
+        nn.init.normal_(self.pos_emb.weight, std=0.02)
         nn.init.zeros_(self.decoder.bias)
         nn.init.normal_(self.decoder.weight, std=(self.d_model ** -0.5))
 
@@ -93,10 +98,8 @@ class GridAdapter(BaseAdapter):
         # Token embedding
         tok = self.token_emb(x)  # [B, L, d_model]
 
-        # 2D position embedding
-        row = self.row_emb(self.row_indices)  # [L, d_model]
-        col = self.col_emb(self.col_indices)  # [L, d_model]
-        pos = (row + col).unsqueeze(0)        # [1, L, d_model]
+        # Full joint 2D position embedding: one vector per (row, col) pair.
+        pos = self.pos_emb(self.pos_indices).unsqueeze(0)  # [1, L, d_model]
 
         emb = tok + pos
         emb = self.input_norm(emb)

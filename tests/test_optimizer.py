@@ -1,7 +1,7 @@
 """Tests for coral/training/optimizer.py — parameter group split.
 
 Verifies that build_optimizer correctly separates:
-  - Embedding weights (token_emb, row_emb, col_emb, level, timescale) → no_decay (WD=0)
+  - Embedding weights (token_emb, pos_emb, level, timescale) → no_decay (WD=0)
   - Bias parameters (1-d tensors) → no_decay (WD=0)
   - Scalar learnable params (cond_gate, row_bias, col_bias, box_bias) → no_decay (WD=0)
   - RMSNorm / LayerNorm parameters → no_decay (WD=0)
@@ -68,18 +68,11 @@ def test_token_embedding_in_no_decay():
     )
 
 
-def test_row_embedding_in_no_decay():
-    """adapter.row_emb.weight must be in the no-decay group."""
+def test_pos_embedding_in_no_decay():
+    """adapter.pos_emb.weight must be in the no-decay group."""
     _, no_decay, _ = _get_param_groups()
-    matches = [n for n in no_decay if "row_emb" in n]
-    assert len(matches) > 0, f"row_emb not in no_decay. no_decay={sorted(no_decay)}"
-
-
-def test_col_embedding_in_no_decay():
-    """adapter.col_emb.weight must be in the no-decay group."""
-    _, no_decay, _ = _get_param_groups()
-    matches = [n for n in no_decay if "col_emb" in n]
-    assert len(matches) > 0, f"col_emb not in no_decay. no_decay={sorted(no_decay)}"
+    matches = [n for n in no_decay if "pos_emb" in n]
+    assert len(matches) > 0, f"pos_emb not in no_decay. no_decay={sorted(no_decay)}"
 
 
 def test_level_embedding_in_no_decay():

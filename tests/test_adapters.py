@@ -3,8 +3,10 @@
 Verification criteria:
   - encode → decode cycle on random grid produces valid logits
   - Smoke test: overfit on 1 puzzle through full pipeline
+  - Full 2D position embedding produces rank well above the old factorized ceiling
 """
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -12,6 +14,16 @@ import torch.optim as optim
 
 from coral.config import CoralConfig, ModelConfig
 from coral.adapters.grid import GridAdapter
+
+
+def _make_config(grid_height: int = 9, grid_width: int = 9,
+                 vocab_size: int = 10, d_model: int = 64) -> CoralConfig:
+    """Build a minimal CoralConfig with the given grid / model dimensions."""
+    return CoralConfig(model=ModelConfig(
+        n_levels=1, level_dims=[d_model], backbone_dim=d_model,
+        n_heads=4, d_k=d_model // 4, ffn_expansion=2,
+        vocab_size=vocab_size, embed_scale=False,
+    ))
 
 
 @pytest.fixture
@@ -131,6 +143,76 @@ def test_embed_scale_false_backward_compat():
         emb2 = adapter2.encode(x)
 
     assert torch.allclose(emb1, emb2), "embed_scale=False should be deterministic across identical configs"
+
+
+def _svd_rank(tensor: torch.Tensor, threshold: float) -> int:
+    """Return PCA rank of a [N, D] tensor at the given cumulative variance threshold."""
+    flat = tensor.reshape(-1, tensor.shape[-1]).float().numpy()
+    S = np.linalg.svd(flat, compute_uv=False)
+    cum = np.cumsum(S ** 2) / max((S ** 2).sum(), 1e-12)
+    return int(np.searchsorted(cum, threshold) + 1)
+
+
+def test_full_2d_position_encoding_rank_ceiling_maze():
+    """Maze adapter (30x30, vocab=6, d=512) must produce encoder rank well
+    above the old factorized ceiling of H+W+vocab = 66.
+
+    Expected under the joint 2D scheme:
+      rank @90% variance  > 200  (old adapter: ~47)
+      rank @99% variance  > 400  (old adapter: ~62)
+    """
+    config = _make_config(grid_height=30, grid_width=30, vocab_size=6, d_model=512)
+    adapter = GridAdapter(config, grid_height=30, grid_width=30, vocab_size=6)
+    adapter.eval()
+
+    inputs = torch.randint(1, 5, (4, 900))
+    with torch.no_grad():
+        encoded = adapter.encode(inputs)  # [4, 900, 512]
+
+    rank_90 = _svd_rank(encoded, 0.90)
+    rank_99 = _svd_rank(encoded, 0.99)
+
+    assert rank_90 > 200, (
+        f"rank @90% variance = {rank_90}, expected > 200 "
+        f"(old factorized ceiling was H+W+vocab = 66)"
+    )
+    assert rank_99 > 400, (
+        f"rank @99% variance = {rank_99}, expected > 400"
+    )
+
+
+def test_full_2d_position_encoding_rank_ceiling_sudoku():
+    """Sudoku adapter (9x9, vocab=10, d=512) should be limited by H*W=81,
+    but well above the old factorized ceiling of H+W+vocab = 28.
+
+    Using constant-token inputs isolates the positional contribution so the
+    rank ceiling is exactly min(H*W, d_model) = 81.  With random tokens the
+    token embeddings would add up to vocab_size extra rank, making the bound
+    harder to assert precisely.
+
+    Expected (constant tokens):
+      rank @99% variance  > 40   (old factorized ceiling was H+W+vocab = 28)
+      rank @99% variance  <= 81  (hard ceiling: 81 unique positions)
+    """
+    config = _make_config(grid_height=9, grid_width=9, vocab_size=10, d_model=512)
+    adapter = GridAdapter(config, grid_height=9, grid_width=9, vocab_size=10)
+    adapter.eval()
+
+    # Constant token=1 across all positions/batches: only positional variation
+    # contributes rank, so the ceiling is exactly H*W = 81.
+    inputs = torch.ones(4, 81, dtype=torch.long)
+    with torch.no_grad():
+        encoded = adapter.encode(inputs)  # [4, 81, 512]
+
+    rank_99 = _svd_rank(encoded, 0.99)
+
+    assert rank_99 > 40, (
+        f"rank @99% variance = {rank_99}, expected > 40 "
+        f"(old factorized ceiling was H+W+vocab = 28)"
+    )
+    assert rank_99 <= 81, (
+        f"rank @99% variance = {rank_99}, exceeds H*W=81 (impossible for 81 unique positions)"
+    )
 
 
 def test_smoke_overfit_single_puzzle():
