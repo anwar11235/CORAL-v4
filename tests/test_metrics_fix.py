@@ -161,3 +161,79 @@ def test_loss_total_is_not_overwritten_by_breakdown():
         "loss/total appears to be a single-segment value rather than the sum. "
         "The breakdown collision may have been reintroduced."
     )
+
+
+# ---------------------------------------------------------------------------
+# Session N1 — Precision dynamics in training-step metrics
+# ---------------------------------------------------------------------------
+
+def _make_trainer_pc(K_max: int = 2) -> TrainerV4:
+    """Trainer with N=2 levels and PC enabled so pc_modules is populated."""
+    config = ModelConfig(
+        n_levels=2, level_dims=[64, 32], backbone_dim=64, n_heads=4, d_k=16,
+        ffn_expansion=2, timescale_base=2, K_max=K_max,
+        use_predictive_coding=True, use_crystallisation=False,
+        use_amort=False, lambda_amort=0.0,
+        epsilon_min=0.01, lambda_pred=0.001, vocab_size=10, mode="pc_only",
+    )
+    coral_config = CoralConfig(model=config, device="cpu")
+    coral_config.training.precision = "float32"
+    coral_config.training.gradient_clip = 1.0
+
+    adapter = GridAdapter(coral_config, vocab_size=10, grid_height=3, grid_width=3)
+    core = CoralCore(config)
+    loss_fn = CoralLoss(config)
+    return TrainerV4(adapter, core, loss_fn, coral_config)
+
+
+def test_train_step_emits_precision_dynamics():
+    """train_step must include precision/* and precision_raw_stat/* for each PC level.
+
+    Regression for Session N1: these metrics were only emitted during Pareto eval
+    (every 5000 steps), leaving a blind spot for the first 500 steps of training.
+    """
+    trainer = _make_trainer_pc(K_max=2)
+    batch = {
+        "inputs": torch.randint(0, 10, (2, 9)),
+        "labels": torch.randint(1, 10, (2, 9)),
+    }
+    metrics = trainer.train_step(batch)
+
+    # Level 0 is the only PC-instrumented level for N=2 (one level pair: 0→1).
+    assert "precision/level0_mean" in metrics, (
+        "train_step must emit precision/level0_mean for PC-enabled models"
+    )
+    assert "precision/level0_min" in metrics, (
+        "train_step must emit precision/level0_min"
+    )
+    assert "precision/level0_max" in metrics, (
+        "train_step must emit precision/level0_max"
+    )
+    assert "precision_raw_stat/level0_mean" in metrics, (
+        "train_step must emit precision_raw_stat/level0_mean (EMA variance buffer)"
+    )
+    # Values must be finite and positive (precision = 1/(ema_var + eps) > 0).
+    assert metrics["precision/level0_mean"] > 0, "precision must be positive"
+    assert metrics["precision_raw_stat/level0_mean"] >= 0, "raw EMA variance must be non-negative"
+
+
+def test_precision_std_not_nan_with_single_element_batch():
+    """precision/level{i}_std must be a finite float even with batch_size=1.
+
+    pi is [dim_lower] — std is computed over the feature dimension (e.g., 64
+    elements), not over the batch dimension, so B=1 does not cause NaN.
+    """
+    trainer = _make_trainer_pc(K_max=2)
+    batch = {
+        "inputs": torch.randint(0, 10, (1, 9)),   # B=1
+        "labels": torch.randint(1, 10, (1, 9)),
+    }
+    metrics = trainer.train_step(batch)
+
+    assert "precision/level0_std" in metrics, (
+        "train_step must emit precision/level0_std"
+    )
+    val = metrics["precision/level0_std"]
+    assert isinstance(val, float), f"precision/level0_std must be a float, got {type(val)}"
+    assert val == val, "precision/level0_std must not be NaN"  # NaN != NaN
+    assert val >= 0, "standard deviation must be non-negative"

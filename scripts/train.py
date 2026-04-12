@@ -222,6 +222,20 @@ def main(cfg: DictConfig) -> None:
                 # Surface conditioning-gate evolution in every quick-eval log line.
                 for i, gate in enumerate(trainer.core.cond_gate):
                     quick_metrics[f"cond_gate/level{i}"] = gate.item()
+                # Precision dynamics — mirror training-step precision metrics at
+                # quick-eval granularity (every eval_every steps).
+                for i, pc in enumerate(trainer.core.pc_modules):
+                    rp = pc.running_precision
+                    pi = rp.precision
+                    ev = rp.ema_var
+                    eps_rms = ev.sqrt()
+                    quick_metrics[f"precision/level{i}_mean"] = pi.mean().item()
+                    quick_metrics[f"precision/level{i}_std"] = pi.std().item()
+                    quick_metrics[f"precision/level{i}_min"] = pi.min().item()
+                    quick_metrics[f"precision/level{i}_max"] = pi.max().item()
+                    quick_metrics[f"prediction_error/level{i}_mean"] = eps_rms.mean().item()
+                    quick_metrics[f"prediction_error/level{i}_max"] = eps_rms.max().item()
+                    quick_metrics[f"precision_raw_stat/level{i}_mean"] = ev.mean().item()
                 if wandb_run is not None:
                     wandb_run.log(quick_metrics, step=step)
                 log.info(

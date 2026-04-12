@@ -160,6 +160,23 @@ class TrainerV4:
         metrics["loss/per_segment_avg"] = total_loss.item() / max(output.num_segments, 1)
         metrics["train/num_segments"] = output.num_segments
 
+        # Precision dynamics — surface running-precision buffers updated during the
+        # forward pass above. Emitted at every training step so early-training
+        # collapse (steps 0–500) is visible between eval checkpoints.
+        # ema_var ≈ E[ε²] per dim; sqrt gives per-dim RMS prediction error proxy.
+        for i, pc in enumerate(self.core.pc_modules):
+            rp = pc.running_precision
+            pi = rp.precision          # [dim_lower] — 1/(ema_var + eps_min), no grad
+            ev = rp.ema_var            # [dim_lower] — raw EMA running variance
+            eps_rms = ev.sqrt()        # per-dim RMS prediction error proxy
+            metrics[f"precision/level{i}_mean"] = pi.mean().item()
+            metrics[f"precision/level{i}_std"] = pi.std().item()
+            metrics[f"precision/level{i}_min"] = pi.min().item()
+            metrics[f"precision/level{i}_max"] = pi.max().item()
+            metrics[f"prediction_error/level{i}_mean"] = eps_rms.mean().item()
+            metrics[f"prediction_error/level{i}_max"] = eps_rms.max().item()
+            metrics[f"precision_raw_stat/level{i}_mean"] = ev.mean().item()
+
         return metrics
 
     @torch.no_grad()
