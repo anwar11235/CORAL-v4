@@ -218,6 +218,28 @@ def test_amortisation_loss_empty():
     assert loss.item() == pytest.approx(0.0)
 
 
+def test_amortisation_loss_empty_input_cpu():
+    """Empty-dict input (baseline mode, no PC) returns a CPU zero tensor when device=cpu."""
+    empty_errors = [{}, {}, {}]
+    result = amortisation_loss(empty_errors, device=torch.device("cpu"))
+    assert result.device.type == "cpu"
+    assert result.item() == pytest.approx(0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_amortisation_loss_empty_input_on_cuda():
+    """Empty-dict input returns a CUDA zero tensor when device=cuda.
+
+    Regression for the bug where phase4_amort_no_crystal.yaml crashed with
+    'Expected all tensors to be on the same device' on the first training step.
+    """
+    cuda = torch.device("cuda")
+    empty_errors = [{}, {}, {}]
+    result = amortisation_loss(empty_errors, device=cuda)
+    assert result.device.type == "cuda"
+    assert result.item() == pytest.approx(0.0)
+
+
 # ---------------------------------------------------------------------------
 # End-to-end: run a forward pass and verify loss properties
 # ---------------------------------------------------------------------------

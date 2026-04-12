@@ -84,6 +84,7 @@ def stablemax_cross_entropy(
 
 def amortisation_loss(
     pred_errors: List[Dict[str, torch.Tensor]],
+    device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """Amortisation pressure: penalise large prediction errors late in training.
 
@@ -92,19 +93,21 @@ def amortisation_loss(
 
     Args:
         pred_errors: List of dicts per segment, each mapping level_key → eps tensor.
+        device:      Device for the accumulator tensor.  Pass the training device
+                     (e.g. ``logits.device``) so the returned tensor is on CUDA when
+                     pred_errors contains only empty dicts (baseline mode with no PC).
+                     When None the accumulator starts on CPU and migrates on the first
+                     eps tensor encountered in the inner loop.
 
     Returns:
-        Scalar loss.
+        Scalar loss on ``device`` (or CPU when device=None and pred_errors is empty).
     """
-    total = torch.tensor(0.0)
+    total = torch.tensor(0.0, device=device)
     if not pred_errors:
         return total
-    # Use the device of the first available tensor
-    device = None
     for seg_errs in pred_errors:
         for eps in seg_errs.values():
-            device = eps.device
-            total = total.to(device)
+            total = total.to(eps.device)
             total = total + eps.pow(2).sum(dim=-1).mean()
     return total
 
@@ -229,7 +232,7 @@ class CoralLoss(nn.Module):
         # ---- Amortisation loss (Experiment 2+) ----
         L_amort = torch.tensor(0.0, device=device)
         if self.config.use_amort and all_pred_errors is not None:
-            L_amort = self.config.lambda_amort * amortisation_loss(all_pred_errors)
+            L_amort = self.config.lambda_amort * amortisation_loss(all_pred_errors, device=device)
         breakdown["loss/amortisation"] = L_amort
 
         # ---- Crystallisation losses (Experiment 3+) ----
