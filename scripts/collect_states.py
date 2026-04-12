@@ -24,11 +24,12 @@ import sys
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from coral.adapters.grid import GridAdapter
-from coral.config import CoralConfig, ModelConfig
+from coral.config import CoralConfig, DataConfig, ModelConfig, TrainingConfig, WandbConfig
 from coral.data.sudoku_dataset import create_sudoku_dataloader
 from coral.model.coral_core import CoralCore
 
@@ -37,33 +38,63 @@ from coral.model.coral_core import CoralCore
 # Checkpoint loading
 # ---------------------------------------------------------------------------
 
-def load_checkpoint(checkpoint_path: str, device: torch.device):
+def load_checkpoint(checkpoint_path: str, config_name: str, device: torch.device):
     """Load a CORAL v4 checkpoint.
 
-    Expected format: dict with keys 'config', 'adapter_state', 'core_state'.
-    Falls back to a bare state dict if the checkpoint is not structured.
+    Config is composed from ``configs/<config_name>.yaml`` via OmegaConf —
+    not cast from the checkpoint dict (which is a plain dict from
+    OmegaConf.to_container, not a CoralConfig dataclass).
+
+    State dicts are loaded with ``strict=False`` to tolerate unexpected keys
+    from older checkpoints (e.g. row_bias/col_bias/box_bias written by
+    Session-F-era runs that pre-date the current adapter layout).
+
+    Args:
+        checkpoint_path: Path to a ``last.pt`` checkpoint saved by train.py.
+        config_name:     Name of the config YAML in ``configs/`` (no extension).
+        device:          Device to map tensors onto.
 
     Returns:
         (adapter, core, config)
     """
+    # Load config from configs/ (identical pattern to diagnose_rank_collapse.py)
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config_path = os.path.join(repo_root, "configs", f"{config_name}.yaml")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    cfg = OmegaConf.load(config_path)
+    config = CoralConfig(
+        model=ModelConfig(**dict(cfg.model)),
+        training=TrainingConfig(**dict(cfg.training)),
+        data=DataConfig(**dict(cfg.data)),
+        wandb=WandbConfig(**dict(cfg.wandb)),
+        seed=int(getattr(cfg, "seed", 42)),
+        device=str(getattr(cfg, "device", "cpu")),
+        experiment_name=str(getattr(cfg, "experiment_name", config_name)),
+    )
+
+    # Build model architecture from config
+    adapter = GridAdapter(
+        config,
+        grid_height=config.data.grid_height,
+        grid_width=config.data.grid_width,
+    )
+    core = CoralCore(config.model)
+
+    # Load weights from nested model_state_dict keys (train.py format)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    msd = ckpt["model_state_dict"]
 
-    if isinstance(ckpt, dict) and "config" in ckpt:
-        config: CoralConfig = ckpt["config"]
-        model_cfg: ModelConfig = config.model
-    else:
-        raise ValueError(
-            f"Checkpoint at {checkpoint_path} does not contain a 'config' key. "
-            "Expected a structured CORAL v4 checkpoint."
-        )
+    res_a = adapter.load_state_dict(msd["adapter"], strict=False)
+    res_c = core.load_state_dict(msd["core"], strict=False)
 
-    adapter = GridAdapter(config, grid_height=9, grid_width=9)
-    core = CoralCore(model_cfg)
-
-    if "adapter_state" in ckpt:
-        adapter.load_state_dict(ckpt["adapter_state"])
-    if "core_state" in ckpt:
-        core.load_state_dict(ckpt["core_state"])
+    if res_a.unexpected_keys or res_a.missing_keys:
+        print(f"  adapter state_dict: unexpected={res_a.unexpected_keys}, "
+              f"missing={res_a.missing_keys}")
+    if res_c.unexpected_keys or res_c.missing_keys:
+        print(f"  core state_dict:    unexpected={res_c.unexpected_keys}, "
+              f"missing={res_c.missing_keys}")
 
     adapter = adapter.to(device)
     core = core.to(device)
@@ -181,6 +212,11 @@ def collect_states(
 def parse_args():
     parser = argparse.ArgumentParser(description="Collect CORAL v4 reasoning states for Phase 2 analysis")
     parser.add_argument("--checkpoint", required=True, help="Path to trained model checkpoint (.pt)")
+    parser.add_argument(
+        "--config-name", required=True,
+        help="Name of the config YAML in configs/ (without .yaml extension), "
+             "e.g. phase1_baseline_no_pc.  Used to reconstruct the model architecture.",
+    )
     parser.add_argument("--data-dir", required=True, help="Path to sudoku_extreme_1k data directory")
     parser.add_argument("--output", required=True, help="Output path for .npz file")
     parser.add_argument(
@@ -201,8 +237,8 @@ def main():
     segment_indices = [int(s.strip()) for s in args.segments.split(",")]
     print(f"Collecting states at segments: {segment_indices}")
 
-    print(f"Loading checkpoint from {args.checkpoint} ...")
-    adapter, core, config = load_checkpoint(args.checkpoint, device)
+    print(f"Loading checkpoint from {args.checkpoint} (config: {args.config_name}) ...")
+    adapter, core, config = load_checkpoint(args.checkpoint, args.config_name, device)
 
     # Use float32 for CPU compat; bfloat16 on GPU
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
