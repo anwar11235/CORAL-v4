@@ -31,6 +31,26 @@ from coral.config import ModelConfig
 # ---------------------------------------------------------------------------
 
 
+def rms_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """RMSNorm without learnable affine parameters.
+
+    Normalizes each token/sample so that its root-mean-square magnitude is 1.
+    Scale-invariant: output is unaffected by the absolute scale of the input.
+
+    Applied symmetrically to both prediction and target before computing the
+    PC prediction error, to keep the loss and its gradient bounded regardless
+    of state norms (which can reach hundreds after many backbone applications).
+
+    Args:
+        x:   [..., d] — any tensor; normalization is along the last dimension.
+        eps: Small floor to prevent division by zero.
+
+    Returns:
+        Tensor with same shape as x, RMS ≈ 1 along the last dimension.
+    """
+    return x / (x.pow(2).mean(dim=-1, keepdim=True).sqrt() + eps)
+
+
 class PredictionNetwork(nn.Module):
     """Top-down prediction: level l+1 predicts level l's state.
 
@@ -223,22 +243,38 @@ class PredictiveCodingModule(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute full predictive coding pass for one level pair.
 
+        Option 2 — single normalised pathway: RMSNorm is applied symmetrically
+        to both the prediction (mu) and the target (z_lower) before eps, the EMA
+        update, and the conditioning signal are computed.  Everything downstream
+        operates on the normalised scale, so precision stays bounded near 1.
+
         Args:
             z_lower: [B, L, d_l]     — lower level state
             z_upper: [B, L, d_{l+1}] — upper level state
 
         Returns:
-            mu:    [B, L, d_l]       — top-down prediction
-            eps:   [B, L, d_l]       — prediction error (z_lower - mu)
+            mu:    [B, L, d_l]       — top-down prediction (raw, pre-normalisation)
+            eps:   [B, L, d_l]       — normalised prediction error
+                                       rms_normalize(z_lower) - rms_normalize(mu)
             pi:    [d_l]             — precision vector (constant, not in grad graph)
-            xi:    [B, L, d_l]       — precision-weighted error
+            xi:    [B, L, d_l]       — precision-weighted normalised error
             xi_up: [B, L, d_{l+1}]  — projected error for upper level input
         """
         mu = self.prediction_net(z_upper)
-        eps = z_lower - mu
 
-        # Update running statistics (no_grad — precision is a constant multiplier).
-        # Called once per segment; the EMA tracks the per-dim error variance.
+        # Symmetric RMSNorm on both sides before any further computation.
+        # This makes the error scale-invariant: prediction errors start bounded
+        # (RMS ≈ 1) regardless of state magnitude, so the EMA never explodes and
+        # precision never collapses.  The Jacobian d(rms_normalize(mu))/d(theta)
+        # ∝ 1/rms(mu) amplifies gradients for the near-zero prediction-net init,
+        # rescuing the dying-gradient trap identified in Session N1.
+        z_lower_norm = rms_normalize(z_lower)
+        mu_norm = rms_normalize(mu)
+        eps = z_lower_norm - mu_norm   # [B, L, d_l], RMS ≈ 1 at init
+
+        # Update EMA with normalised error (no_grad — precision is a constant).
+        # ema_var now tracks normalised variance, which stays bounded near 1.0;
+        # precision/level{i}_* diagnostics reflect a health indicator, not raw scale.
         self.running_precision.update(eps)
         pi = self.running_precision.precision  # [dim_lower], not in grad graph
 
