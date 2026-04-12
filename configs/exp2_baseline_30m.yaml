@@ -1,0 +1,97 @@
+# CORAL v4 — Experiment 2: PC at 30M parameters (post-RMSNorm fix)
+# Goal: Validate that PC mechanism engages when gradients flow and
+#   capacity is not a confounding factor. First run under the
+#   mechanism-first / compression-later framing (2026-04-12).
+# Not a benchmark target. Observing: precision stability, cond_gate
+#   movement, token_accuracy@K K-dependence.
+
+model:
+  # Hierarchy
+  n_levels: 2
+  level_dims: [768, 384]
+
+  # Backbone
+  backbone_layers: 3
+  backbone_dim: 768
+  n_heads: 8
+  d_k: 64
+  ffn_expansion: 4
+
+  # Timescale: T=3 → level 0 gets 3 steps, level 1 gets 1 step per segment
+  timescale_base: 3
+
+  # Predictive coding (ON for Exp 2)
+  use_predictive_coding: true
+  lambda_pred: 0.001
+  lambda_pi: 0.001
+  epsilon_min: 0.01
+
+  # Halting
+  K_max: 16
+  halting_threshold: 0.95
+  halting_exploration_prob: 0.1
+  halting_gamma: 0.9
+
+  # Components disabled for Experiment 2
+  use_crystallisation: false
+  use_column_heads: false
+  use_stochastic: false
+  use_amort: false
+  lambda_amort: 0.0
+  lambda_crystal: 0.0
+  lambda_commit: 0.0
+
+  # Adapter
+  vocab_size: 11
+
+training:
+  epochs: 20000
+  batch_size: 64
+  learning_rate: 7e-5
+  weight_decay: 1.0
+  betas: [0.9, 0.95]
+  gradient_clip: 1.0
+  scheduler: cosine
+  warmup_steps: 500
+
+  # Mixed precision
+  precision: bfloat16
+  loss_precision: float64
+
+  # Full backprop within segment — KEY change from v3
+  full_inner_backprop: true
+
+  # Evaluation
+  eval_every: 500          # quick eval: first quick_eval_samples puzzles, full K_max
+  pareto_eval_every: 5000  # full Pareto eval: all puzzles, K=1,2,4,8,16
+  quick_eval_samples: 100
+  log_every: 50
+
+  # Optimizer: try fused_adam_atan2 first, fall back to adamw
+  optimizer: adamw
+
+  # torch.compile wraps core.backbone only (not the full CoralCore).
+  # dynamic=False: correct for Sudoku (fixed seq_len=81). Set true for
+  # variable-length tasks like ARC where grid size varies per puzzle.
+  compile_model: false
+  compile_dynamic: false
+
+data:
+  dataset: sudoku_extreme_1k
+  dataset_path: data/sudoku_extreme_1k
+  augmentation_factor: 1000
+  eval_size: 1000
+  num_workers: 4
+  seq_len: 81
+
+wandb:
+  project: "Sudoku-extreme-1k-aug-1000 CORAL-v4"
+  entity: aktuator-ai
+  run_name: v4-exp2-baseline-30m
+  tags: ["v4", "exp2", "30m", "shared-backbone", "full-backprop", "predictive-coding", "rmsnorm-fix"]
+  log_every: 50
+  disabled: false
+
+seed: 42
+device: cuda
+experiment_name: exp2_baseline_30m
