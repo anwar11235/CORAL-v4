@@ -187,7 +187,7 @@ def _make_trainer_pc(K_max: int = 2) -> TrainerV4:
 
 
 def test_train_step_emits_precision_dynamics():
-    """train_step must include precision/* and precision_raw_stat/* for each PC level.
+    """train_step must include precision/* and precision_ema_var/* for each PC level.
 
     Regression for Session N1: these metrics were only emitted during Pareto eval
     (every 5000 steps), leaving a blind spot for the first 500 steps of training.
@@ -209,12 +209,12 @@ def test_train_step_emits_precision_dynamics():
     assert "precision/level0_max" in metrics, (
         "train_step must emit precision/level0_max"
     )
-    assert "precision_raw_stat/level0_mean" in metrics, (
-        "train_step must emit precision_raw_stat/level0_mean (EMA variance buffer)"
+    assert "precision_ema_var/level0_mean" in metrics, (
+        "train_step must emit precision_ema_var/level0_mean (EMA variance buffer)"
     )
     # Values must be finite and positive (precision = 1/(ema_var + eps) > 0).
     assert metrics["precision/level0_mean"] > 0, "precision must be positive"
-    assert metrics["precision_raw_stat/level0_mean"] >= 0, "raw EMA variance must be non-negative"
+    assert metrics["precision_ema_var/level0_mean"] >= 0, "EMA variance must be non-negative"
 
 
 def test_precision_std_not_nan_with_single_element_batch():

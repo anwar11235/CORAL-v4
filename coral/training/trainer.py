@@ -141,7 +141,7 @@ class TrainerV4:
             raise RuntimeError(
                 f"Non-finite loss detected at step {self.step}: {total_loss.item()}. "
                 f"Training aborted to prevent silent corruption. "
-                f"Check state_norm_mean, precision_raw_stat, and prediction_error "
+                f"Check state_norm_mean, precision_ema_var, and prediction_error "
                 f"trends in the most recent logs for diagnostic context."
             )
         self.optimizer.zero_grad()
@@ -182,7 +182,7 @@ class TrainerV4:
             metrics[f"precision/level{i}_max"] = pi.max().item()
             metrics[f"prediction_error/level{i}_mean"] = eps_rms.mean().item()
             metrics[f"prediction_error/level{i}_max"] = eps_rms.max().item()
-            metrics[f"precision_raw_stat/level{i}_mean"] = ev.mean().item()
+            metrics[f"precision_ema_var/level{i}_mean"] = ev.mean().item()
 
         return metrics
 

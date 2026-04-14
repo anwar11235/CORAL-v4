@@ -235,7 +235,7 @@ def main(cfg: DictConfig) -> None:
                     quick_metrics[f"precision/level{i}_max"] = pi.max().item()
                     quick_metrics[f"prediction_error/level{i}_mean"] = eps_rms.mean().item()
                     quick_metrics[f"prediction_error/level{i}_max"] = eps_rms.max().item()
-                    quick_metrics[f"precision_raw_stat/level{i}_mean"] = ev.mean().item()
+                    quick_metrics[f"precision_ema_var/level{i}_mean"] = ev.mean().item()
                 if wandb_run is not None:
                     wandb_run.log(quick_metrics, step=step)
                 log.info(
@@ -256,7 +256,7 @@ def main(cfg: DictConfig) -> None:
                     max_puzzles=getattr(config.training, "pareto_eval_samples", 100),
                     dataset_name=config.data.dataset,
                 )
-                _log_precision_metrics(trainer, eval_loader, device, pareto_results)
+                _log_eval_diagnostics(trainer, pareto_results)
                 if wandb_run is not None:
                     wandb_run.log(pareto_results, step=step)
                 log.info(
@@ -294,40 +294,26 @@ def _save_checkpoint(trainer: "TrainerV4", cfg: DictConfig, step: int, output_di
     log.info(f"Checkpoint saved → {ckpt_path}")
 
 
-def _log_precision_metrics(trainer, eval_loader, device, out_dict):
-    """Collect precision/error stats from one eval batch and add to out_dict."""
-    trainer.adapter.eval()
-    trainer.core.eval()
-    dtype = trainer.dtype
+def _log_eval_diagnostics(trainer, out_dict):
+    """Read precision/error diagnostics from running_precision buffers and add to out_dict.
 
-    try:
-        batch = next(iter(eval_loader))
-        inputs = batch["inputs"].to(device)
-        labels = batch["labels"].to(device)
-
-        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=dtype):
-            z1 = trainer.adapter.encode(inputs)
-            B, L, _ = z1.shape
-            z_states = [z1]
-            cfg = trainer.core.config
-            for i in range(1, cfg.n_levels):
-                d_l = cfg.level_dims[i]
-                z_states.append(torch.zeros(B, L, d_l, device=device, dtype=dtype))
-
-            # Run one segment to get precision stats
-            if cfg.use_predictive_coding:
-                for i in range(cfg.n_levels - 2, -1, -1):
-                    pred = trainer.core.pc_modules[i].predict(z_states[i + 1])
-                for i in range(cfg.n_levels):
-                    z_states[i] = trainer.core._run_level(z_states[i], i, cfg.timescale_base, None)
-                    if i < cfg.n_levels - 1:
-                        _, eps, pi, _, _ = trainer.core.pc_modules[i](z_states[i], z_states[i + 1])
-                        out_dict[f"precision/level{i}_mean"] = pi.mean().item()
-                        out_dict[f"precision/level{i}_std"] = pi.std().item()
-                        out_dict[f"prediction_error/level{i}_mean"] = eps.abs().mean().item()
-                        out_dict[f"prediction_error/level{i}_max"] = eps.abs().max().item()
-    except Exception as e:
-        log.warning(f"Precision metric collection failed: {e}")
+    Called after evaluate_pareto, which has already run the real forward pass and updated
+    the running_precision EMA buffers.  Reading the buffers here produces the same values
+    as training-step precision metrics, making Pareto-time and training-time series
+    directly comparable.  No second forward pass is performed.
+    """
+    for i, pc in enumerate(trainer.core.pc_modules):
+        rp = pc.running_precision
+        pi = rp.precision          # [dim_lower] — 1/(ema_var + eps_min), no grad
+        ev = rp.ema_var            # [dim_lower] — EMA variance of normalized error
+        eps_rms = ev.sqrt()        # per-dim RMS prediction-error proxy (matches training-step)
+        out_dict[f"precision/level{i}_mean"] = pi.mean().item()
+        out_dict[f"precision/level{i}_std"] = pi.std().item()
+        out_dict[f"precision/level{i}_min"] = pi.min().item()
+        out_dict[f"precision/level{i}_max"] = pi.max().item()
+        out_dict[f"prediction_error/level{i}_mean"] = eps_rms.mean().item()
+        out_dict[f"prediction_error/level{i}_max"] = eps_rms.max().item()
+        out_dict[f"precision_ema_var/level{i}_mean"] = ev.mean().item()
 
     # Log learnable conditioning gate values
     for i, gate in enumerate(trainer.core.cond_gate):
