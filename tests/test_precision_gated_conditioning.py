@@ -1,10 +1,11 @@
 """Tests for Session N3: precision-gated top-down conditioning.
 
 Verification criteria:
-  - gate × (π × μ): doubling π produces exactly 2× the conditioning addition
-    (backbone output is identical; only the conditioning term differs)
+  - gate × (π × rms_normalize(μ)): doubling π produces exactly 2× the
+    conditioning addition — measured in rms_normalize(conditioning) units,
+    not raw conditioning units (N4 applies rms_normalize at the injection site)
   - Prediction network receives gradients from the backbone task loss via the
-    new gate × (π × μ) path (not just from loss/prediction)
+    new gate × (π × rms_normalize(μ)) path (not just from loss/prediction)
 """
 
 import torch
@@ -13,6 +14,7 @@ import torch.nn.functional as F
 from coral.config import CoralConfig, ModelConfig
 from coral.adapters.grid import GridAdapter
 from coral.model.coral_core import CoralCore
+from coral.model.predictive_coding import rms_normalize
 
 
 def _pc_n2_config(**kwargs) -> ModelConfig:
@@ -40,16 +42,17 @@ def _pc_n2_config(**kwargs) -> ModelConfig:
 def test_precision_scales_conditioning_linearly():
     """Doubling π must double the conditioning addition to z_new.
 
-    Under gate × (π × μ), the addition is gate * pi * conditioning.
-    Backbone_in does not contain conditioning, so the backbone output
-    z_backbone is identical for both precision values.  Therefore:
+    Under gate × (π × rms_normalize(μ)) [N4 formula], the addition is
+    gate * pi * rms_normalize(conditioning).  Backbone_in does not contain
+    conditioning, so the backbone output z_backbone is identical for both
+    precision values.  Therefore:
 
-        z_out1 = z_backbone + gate * pi1 * conditioning
-        z_out2 = z_backbone + gate * pi2 * conditioning
-        z_out2 - z_out1 = gate * (pi2 - pi1) * conditioning
+        z_out1 = z_backbone + gate * pi1 * rms_normalize(conditioning)
+        z_out2 = z_backbone + gate * pi2 * rms_normalize(conditioning)
+        z_out2 - z_out1 = gate * (pi2 - pi1) * rms_normalize(conditioning)
 
     With gate=1.0, pi1=1.0, pi2=2.0:
-        z_out2 - z_out1 == conditioning  (elementwise)
+        z_out2 - z_out1 == rms_normalize(conditioning)  (elementwise)
     """
     torch.manual_seed(42)
     config = _pc_n2_config()
@@ -75,13 +78,14 @@ def test_precision_scales_conditioning_linearly():
         z_out2 = core._run_level(z.clone(), level_idx=0, n_steps=1,
                                  conditioning=conditioning)
 
-    # Expected: z_out2 - z_out1 = gate * (pi2 - pi1) * conditioning
-    #                            = 1.0  *  (2.0 - 1.0)  * conditioning
-    #                            = conditioning
+    # Expected: z_out2 - z_out1 = gate * (pi2 - pi1) * rms_normalize(conditioning)
+    #                            = 1.0  *  (2.0 - 1.0)  * rms_normalize(conditioning)
+    #                            = rms_normalize(conditioning)
     diff = z_out2 - z_out1
-    max_err = (diff - conditioning).abs().max().item()
+    expected = rms_normalize(conditioning)
+    max_err = (diff - expected).abs().max().item()
     assert max_err < 1e-4, (
-        f"Expected z_out2 - z_out1 == conditioning (pi doubles, gate=1), "
+        f"Expected z_out2 - z_out1 == rms_normalize(conditioning) (pi doubles, gate=1), "
         f"max elementwise error = {max_err:.6f}"
     )
 

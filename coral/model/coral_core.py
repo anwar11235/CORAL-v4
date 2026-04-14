@@ -41,7 +41,7 @@ from coral.model.backbone import CoralBackbone, LevelEmbedding, TimescaleEmbeddi
 from coral.model.crystallisation import CrystallisationManager
 from coral.model.halting import HaltingNetwork, should_halt
 from coral.model.level_module import LevelStack
-from coral.model.predictive_coding import PredictiveCodingModule
+from coral.model.predictive_coding import PredictiveCodingModule, rms_normalize
 
 
 # ---------------------------------------------------------------------------
@@ -280,13 +280,20 @@ class CoralCore(nn.Module):
             )
             if conditioning is not None:
                 if level_idx < len(self.pc_modules):
-                    # Precision-gated top-down injection: gate × (π × μ).
-                    # π is a buffer-derived constant (no grad); μ stays in the
-                    # gradient graph so the backbone task loss provides a learning
-                    # signal to the prediction network via this path.
+                    # Precision-gated top-down injection: gate × (π × rms_normalize(μ)).
+                    # rms_normalize brings the conditioning signal to unit RMS per sample,
+                    # matching the prediction-loss formulation (where both prediction and
+                    # target are RMS-normalised before computing the error).  This makes
+                    # the injection scale-invariant: the magnitude of μ has no effect on
+                    # the backbone state, only its direction and the learned precision.
+                    # Without this, μ converges to α × z (direction-matched but scale-
+                    # unconstrained), causing a compounding state-norm feedback loop.
+                    # π is a buffer-derived constant (no grad); μ stays in the gradient
+                    # graph so the backbone task loss provides a learning signal to the
+                    # prediction network via this path.
                     pi = self.pc_modules[level_idx].running_precision.precision  # [dim_lower]
                     pi = pi.to(dtype=conditioning.dtype)
-                    z_new = z_new + self.cond_gate[level_idx] * (pi * conditioning)
+                    z_new = z_new + self.cond_gate[level_idx] * (pi * rms_normalize(conditioning))
                 else:
                     # Level has conditioning from error-up-projection (xi_up), not a
                     # top-down prediction — keep residual formulation unchanged.

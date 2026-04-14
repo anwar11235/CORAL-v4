@@ -137,6 +137,13 @@ class TrainerV4:
                 total_loss = total_loss + weight * seg_loss
                 all_breakdowns.append(breakdown)
 
+        if not torch.isfinite(total_loss):
+            raise RuntimeError(
+                f"Non-finite loss detected at step {self.step}: {total_loss.item()}. "
+                f"Training aborted to prevent silent corruption. "
+                f"Check state_norm_mean, precision_raw_stat, and prediction_error "
+                f"trends in the most recent logs for diagnostic context."
+            )
         self.optimizer.zero_grad()
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(
