@@ -203,11 +203,12 @@ class CoralCore(nn.Module):
             z_new  = project_down(backbone(project_up(z) + level_emb + ts_emb + input_injection))
             z      = z_new + gate * (conditioning - z)   # if conditioning given
 
-        The residual (conditioning - z) represents what the conditioning signal
-        expects minus what the state currently is.  When conditioning ≈ z the
-        residual is near zero, so accurate predictions cause no interference.
-        When conditioning diverges from z it actively steers the update.
-        The learnable gate (init=1) controls correction strength per level.
+        Precision-gated top-down conditioning: trusted predictions (high π)
+        actively contribute to the backbone state in proportion to their
+        reliability. This implements the active inference reading where
+        top-down expectations shape lower-level activity, modulated by
+        neuromodulatory-style precision gain. The learnable gate (init=0.01)
+        controls the overall conditioning strength per level.
 
         Args:
             z:              [B, L, d_l] — current level state
@@ -278,7 +279,18 @@ class CoralCore(nn.Module):
                 self.backbone(backbone_in, attention_bias=attention_bias)
             )
             if conditioning is not None:
-                z_new = z_new + self.cond_gate[level_idx] * (conditioning - z_in)
+                if level_idx < len(self.pc_modules):
+                    # Precision-gated top-down injection: gate × (π × μ).
+                    # π is a buffer-derived constant (no grad); μ stays in the
+                    # gradient graph so the backbone task loss provides a learning
+                    # signal to the prediction network via this path.
+                    pi = self.pc_modules[level_idx].running_precision.precision  # [dim_lower]
+                    pi = pi.to(dtype=conditioning.dtype)
+                    z_new = z_new + self.cond_gate[level_idx] * (pi * conditioning)
+                else:
+                    # Level has conditioning from error-up-projection (xi_up), not a
+                    # top-down prediction — keep residual formulation unchanged.
+                    z_new = z_new + self.cond_gate[level_idx] * (conditioning - z_in)
             # Record level-state norm after this inner step (d_l space, includes conditioning).
             if _norm_collector is not None:
                 _norm_collector["post_backbone"].append(
