@@ -198,17 +198,21 @@ class CoralCore(nn.Module):
 
         The backbone processes the level state without prediction interference.
         After each backbone step, the conditioning signal is applied as a
-        residual correction in d_l space:
+        residual correction in d_l space.  Two formulations, applied
+        symmetrically:
 
-            z_new  = project_down(backbone(project_up(z) + level_emb + ts_emb + input_injection))
-            z      = z_new + gate * (conditioning - z)   # if conditioning given
+        Level l with pc_module (top-down prediction μ available):
+            z = z_new + gate[l] * (π_l × rms_normalize(μ))
 
-        Precision-gated top-down conditioning: trusted predictions (high π)
-        actively contribute to the backbone state in proportion to their
-        reliability. This implements the active inference reading where
-        top-down expectations shape lower-level activity, modulated by
-        neuromodulatory-style precision gain. The learnable gate (init=0.01)
-        controls the overall conditioning strength per level.
+        Level l without pc_module (error-up-projection xi_up available):
+            z = z_new + gate[l] * rms_normalize(xi_up)
+
+        Both formulations use rms_normalize to make the injection
+        scale-invariant.  Precision weighting at level l is explicit (π_l)
+        where a pc_module exists; it is implicit in xi_up's construction
+        (xi_up = error_up_proj(pi_{l-1} * eps_{l-1})) where it does not.
+        The learnable gate (init=0.01) controls the overall conditioning
+        strength per level.
 
         Args:
             z:              [B, L, d_l] — current level state
@@ -295,9 +299,18 @@ class CoralCore(nn.Module):
                     pi = pi.to(dtype=conditioning.dtype)
                     z_new = z_new + self.cond_gate[level_idx] * (pi * rms_normalize(conditioning))
                 else:
-                    # Level has conditioning from error-up-projection (xi_up), not a
-                    # top-down prediction — keep residual formulation unchanged.
-                    z_new = z_new + self.cond_gate[level_idx] * (conditioning - z_in)
+                    # Precision-gated error injection (Scenario B): conditioning here is
+                    # xi_up = error_up_proj(pi_0 * eps_0) — the upward-projected prediction
+                    # error from level below.  Level l+1 has no pc_module in N=2 (no level
+                    # l+2 to predict), so there is no separate precision to multiply.
+                    # Precision weighting is already embedded in xi_up's construction
+                    # (pi_0 scales eps_0 before the up-projection).
+                    # rms_normalize is applied for the same reason as at level 0: makes the
+                    # injection scale-invariant regardless of xi_up's magnitude trajectory.
+                    # The prior formula gate × (xi_up − z_in) was self-erasing because
+                    # z_in dominates xi_up by orders of magnitude; removing the subtraction
+                    # allows the gate to learn non-trivially.
+                    z_new = z_new + self.cond_gate[level_idx] * rms_normalize(conditioning)
             # Record level-state norm after this inner step (d_l space, includes conditioning).
             if _norm_collector is not None:
                 _norm_collector["post_backbone"].append(
