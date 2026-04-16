@@ -27,7 +27,10 @@ class ModelConfig:
     # Predictive coding
     use_predictive_coding: bool = True
     lambda_pred: float = 0.1
-    lambda_pi: float = 0.001  # DEPRECATED in v4.2: precision regulariser removed; kept for backward compat
+    # Precision regulariser: symmetric log-normal, minimum at pi=1.
+    # Removed in v4.2 (led to unbounded precision drift to 35+ in N5).
+    # Reintroduced in v5: loss path only; gate handles conditioning separately.
+    lambda_pi: float = 0.001
     epsilon_min: float = 0.01  # minimum precision floor
 
     # Halting
@@ -58,6 +61,11 @@ class ModelConfig:
     # v4.2 additions: losses and precision
     lambda_dis: float = 0.01         # disentanglement loss weight
     precision_momentum: float = 0.99  # EMA momentum for running-statistics precision
+
+    # v5 ConditioningGate: feature-selective MLP gate replacing scalar cond_gate.
+    # gate_hidden_dim = 0 means use each level's own d_model as hidden width.
+    gate_hidden_dim: int = 0
+    gate_init_bias: float = -2.0  # sigmoid(-2) ~ 0.12: gate starts mostly closed
     maze_path_loss_weight: float = 40.0  # alpha: upweight factor for non-trivial cells in maze task loss
 
     # v4.2 additions: attention and mode

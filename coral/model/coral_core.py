@@ -38,6 +38,7 @@ import torch.nn as nn
 
 from coral.config import CoralConfig, ModelConfig
 from coral.model.backbone import CoralBackbone, LevelEmbedding, TimescaleEmbedding
+from coral.model.conditioning_gate import ConditioningGate
 from coral.model.crystallisation import CrystallisationManager
 from coral.model.halting import HaltingNetwork, should_halt
 from coral.model.level_module import LevelStack
@@ -158,11 +159,18 @@ class CoralCore(nn.Module):
         else:
             self.crystallisation_manager = None
 
-        # Learnable scalar gate per level that controls conditioning strength.
-        # Initialised to 0.01 so conditioning starts as a 1% nudge.
-        # The model can increase the gate if the prediction proves useful.
-        self.cond_gate = nn.ParameterList([
-            nn.Parameter(torch.full((1,), 0.01)) for _ in range(config.n_levels)
+        # v5 ConditioningGate: context-dependent, per-feature MLP gate.
+        # Replaces v4's scalar cond_gate. Takes the post-backbone state z as
+        # input and produces a per-feature gate in (0, 1) via sigmoid.
+        # Output bias initialised to -2.0: sigmoid(-2) ~ 0.12 (gate mostly closed).
+        # Each level uses its own dimensionality (level_dims[i]).
+        self.conditioning_gates = nn.ModuleList([
+            ConditioningGate(
+                d_model=config.level_dims[i],
+                hidden_dim=getattr(config, "gate_hidden_dim", 0),
+                init_bias=getattr(config, "gate_init_bias", -2.0),
+            )
+            for i in range(config.n_levels)
         ])
 
         # Linear projection to initialise higher-level states from the level
@@ -283,34 +291,14 @@ class CoralCore(nn.Module):
                 self.backbone(backbone_in, attention_bias=attention_bias)
             )
             if conditioning is not None:
-                if level_idx < len(self.pc_modules):
-                    # Precision-gated top-down injection: gate × (π × rms_normalize(μ)).
-                    # rms_normalize brings the conditioning signal to unit RMS per sample,
-                    # matching the prediction-loss formulation (where both prediction and
-                    # target are RMS-normalised before computing the error).  This makes
-                    # the injection scale-invariant: the magnitude of μ has no effect on
-                    # the backbone state, only its direction and the learned precision.
-                    # Without this, μ converges to α × z (direction-matched but scale-
-                    # unconstrained), causing a compounding state-norm feedback loop.
-                    # π is a buffer-derived constant (no grad); μ stays in the gradient
-                    # graph so the backbone task loss provides a learning signal to the
-                    # prediction network via this path.
-                    pi = self.pc_modules[level_idx].running_precision.precision  # [dim_lower]
-                    pi = pi.to(dtype=conditioning.dtype)
-                    z_new = z_new + self.cond_gate[level_idx] * (pi * rms_normalize(conditioning))
-                else:
-                    # Precision-gated error injection (Scenario B): conditioning here is
-                    # xi_up = error_up_proj(pi_0 * eps_0) — the upward-projected prediction
-                    # error from level below.  Level l+1 has no pc_module in N=2 (no level
-                    # l+2 to predict), so there is no separate precision to multiply.
-                    # Precision weighting is already embedded in xi_up's construction
-                    # (pi_0 scales eps_0 before the up-projection).
-                    # rms_normalize is applied for the same reason as at level 0: makes the
-                    # injection scale-invariant regardless of xi_up's magnitude trajectory.
-                    # The prior formula gate × (xi_up − z_in) was self-erasing because
-                    # z_in dominates xi_up by orders of magnitude; removing the subtraction
-                    # allows the gate to learn non-trivially.
-                    z_new = z_new + self.cond_gate[level_idx] * rms_normalize(conditioning)
+                # v5 conditioning primitive (both levels, unified formulation):
+                # gate(z_new) produces a per-feature weight in (0, 1) via sigmoid.
+                # rms_normalize keeps the conditioning signal scale-invariant.
+                # Precision is NOT in this path (Phase 1 validated: gate x precision
+                # is harmful — gradient competition with the gate).
+                # State-norm safety by construction: sigmoid x RMSNorm = bounded.
+                gate = self.conditioning_gates[level_idx](z_new)
+                z_new = z_new + gate * rms_normalize(conditioning)
             # Record level-state norm after this inner step (d_l space, includes conditioning).
             if _norm_collector is not None:
                 _norm_collector["post_backbone"].append(

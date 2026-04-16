@@ -102,13 +102,13 @@ def test_loss_total_greater_than_last_seg_for_multiple_segments():
 # Regression: ensure the old collision no longer occurs
 # ---------------------------------------------------------------------------
 
-def test_eval_step_emits_cond_gate_for_each_level():
-    """eval_step must include cond_gate/level{i} for every hierarchy level.
+def test_eval_step_emits_gate_dynamics_for_each_level():
+    """eval_step must include gate/level{i}_mean for every hierarchy level.
 
-    Regression for Session M1: cond_gate was only logged during Pareto eval
-    (pareto_eval_every=5000), so it never appeared in quick-eval log lines.
+    Regression for Session M1 (updated for v5): cond_gate replaced by
+    ConditioningGate MLP in v5. gate/level{i}_mean replaces cond_gate/level{i}.
     """
-    # N=2, PC enabled so both cond_gate[0] and cond_gate[1] exist on the core.
+    # N=2, PC enabled so both conditioning_gates[0] and [1] exist on the core.
     config = ModelConfig(
         n_levels=2, level_dims=[64, 32], backbone_dim=64, n_heads=4, d_k=16,
         ffn_expansion=2, timescale_base=2, K_max=2,
@@ -131,16 +131,17 @@ def test_eval_step_emits_cond_gate_for_each_level():
     }
     metrics = trainer.eval_step(batch)
 
-    assert "cond_gate/level0" in metrics, (
-        "eval_step must emit cond_gate/level0; "
-        "check TrainerV4.eval_step for the cond_gate loop"
+    assert "gate/level0_mean" in metrics, (
+        "eval_step must emit gate/level0_mean; "
+        "check TrainerV4.eval_step for the conditioning_gates loop"
     )
-    assert "cond_gate/level1" in metrics, (
-        "eval_step must emit cond_gate/level1 for N=2 models"
+    assert "gate/level1_mean" in metrics, (
+        "eval_step must emit gate/level1_mean for N=2 models"
     )
-    # Values should be close to the init of 0.01 (unchanged by a no-grad eval pass)
-    assert isinstance(metrics["cond_gate/level0"], float)
-    assert isinstance(metrics["cond_gate/level1"], float)
+    # Values should be close to sigmoid(-2) ~ 0.12 at init
+    assert isinstance(metrics["gate/level0_mean"], float)
+    assert isinstance(metrics["gate/level1_mean"], float)
+    assert 0.0 < metrics["gate/level0_mean"] < 1.0, "gate mean must be in (0, 1)"
 
 
 def test_loss_total_is_not_overwritten_by_breakdown():

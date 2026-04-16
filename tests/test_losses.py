@@ -124,15 +124,22 @@ def test_baseline_loss_no_pc_no_crystal():
     assert breakdown["loss/task"].item() > 0.0, "Task loss must be positive"
 
 
-def test_precision_regulariser_not_in_loss():
-    """Precision regulariser was removed in v4.2: breakdown must NOT contain loss/precision_reg."""
+def test_precision_regulariser_zero_when_no_precisions():
+    """loss/precision_reg must be present in breakdown but zero when no precisions are passed.
+
+    v5 reintroduced the precision regulariser (removed in v4.2, led to unbounded drift).
+    When precisions=None (baseline mode, no PC), L_pi must be 0.
+    """
     config = _baseline_config()
     loss_fn = CoralLoss(config)
     logits, labels = _make_fake_logits_labels()
     _, breakdown = loss_fn(logits=logits, labels=labels)
 
-    assert "loss/precision_reg" not in breakdown, (
-        "loss/precision_reg was removed in v4.2 — should not appear in breakdown"
+    assert "loss/precision_reg" in breakdown, (
+        "loss/precision_reg must appear in breakdown (v5 reintroduction)"
+    )
+    assert breakdown["loss/precision_reg"].item() == 0.0, (
+        "loss/precision_reg must be 0 when no precisions are passed (baseline mode)"
     )
 
 

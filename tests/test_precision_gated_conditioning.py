@@ -1,11 +1,13 @@
-"""Tests for Session N3: precision-gated top-down conditioning.
+"""Tests for v5 conditioning: gate-only formulation (updated from Session N3).
 
-Verification criteria:
-  - gate × (π × rms_normalize(μ)): doubling π produces exactly 2× the
-    conditioning addition — measured in rms_normalize(conditioning) units,
-    not raw conditioning units (N4 applies rms_normalize at the injection site)
-  - Prediction network receives gradients from the backbone task loss via the
-    new gate × (π × rms_normalize(μ)) path (not just from loss/prediction)
+Session N3 added precision-gated conditioning (gate x pi x rms_normalize(mu)).
+Phase 1 synthetic validation showed gate x precision is harmful (gradient competition).
+v5 removes precision from the conditioning path entirely.
+
+The test_precision_scales_conditioning_linearly test is removed — that invariant
+is no longer valid (precision is not in the conditioning path).
+
+Kept: gradient path test (prediction network receives gradients from task loss).
 """
 
 import torch
@@ -18,7 +20,7 @@ from coral.model.predictive_coding import rms_normalize
 
 
 def _pc_n2_config(**kwargs) -> ModelConfig:
-    """Minimal N=2 pc_only config for precision-gated conditioning tests."""
+    """Minimal N=2 pc_only config for conditioning tests."""
     return ModelConfig(
         n_levels=2,
         level_dims=[64, 32],
@@ -39,65 +41,15 @@ def _pc_n2_config(**kwargs) -> ModelConfig:
     )
 
 
-def test_precision_scales_conditioning_linearly():
-    """Doubling π must double the conditioning addition to z_new.
-
-    Under gate × (π × rms_normalize(μ)) [N4 formula], the addition is
-    gate * pi * rms_normalize(conditioning).  Backbone_in does not contain
-    conditioning, so the backbone output z_backbone is identical for both
-    precision values.  Therefore:
-
-        z_out1 = z_backbone + gate * pi1 * rms_normalize(conditioning)
-        z_out2 = z_backbone + gate * pi2 * rms_normalize(conditioning)
-        z_out2 - z_out1 = gate * (pi2 - pi1) * rms_normalize(conditioning)
-
-    With gate=1.0, pi1=1.0, pi2=2.0:
-        z_out2 - z_out1 == rms_normalize(conditioning)  (elementwise)
-    """
-    torch.manual_seed(42)
-    config = _pc_n2_config()
-    core = CoralCore(config)
-    core.eval()
-
-    # Pin gate to 1.0 so the effect is purely from precision scaling.
-    core.cond_gate[0].data.fill_(1.0)
-
-    B, L, d0 = 1, 4, 64
-    z = torch.zeros(B, L, d0)
-    conditioning = torch.randn(B, L, d0)
-
-    # Pass 1: ema_var = 0.99  →  pi = 1 / (0.99 + 0.01) = 1.0
-    core.pc_modules[0].running_precision.ema_var.fill_(0.99)
-    with torch.no_grad():
-        z_out1 = core._run_level(z.clone(), level_idx=0, n_steps=1,
-                                 conditioning=conditioning)
-
-    # Pass 2: ema_var = 0.49  →  pi = 1 / (0.49 + 0.01) = 2.0
-    core.pc_modules[0].running_precision.ema_var.fill_(0.49)
-    with torch.no_grad():
-        z_out2 = core._run_level(z.clone(), level_idx=0, n_steps=1,
-                                 conditioning=conditioning)
-
-    # Expected: z_out2 - z_out1 = gate * (pi2 - pi1) * rms_normalize(conditioning)
-    #                            = 1.0  *  (2.0 - 1.0)  * rms_normalize(conditioning)
-    #                            = rms_normalize(conditioning)
-    diff = z_out2 - z_out1
-    expected = rms_normalize(conditioning)
-    max_err = (diff - expected).abs().max().item()
-    assert max_err < 1e-4, (
-        f"Expected z_out2 - z_out1 == rms_normalize(conditioning) (pi doubles, gate=1), "
-        f"max elementwise error = {max_err:.6f}"
-    )
-
-
 def test_task_loss_gradients_reach_prediction_network():
     """Prediction network must receive gradients from the backbone task loss.
 
-    Under the new gate × (π × μ) formulation, predictions enter the backbone
-    state directly (not only via loss/prediction).  Setting lambda_pred=0
-    disables the prediction loss, leaving only the task loss.  If the
-    prediction network still gets gradients, the coupling through the
-    backbone is confirmed.
+    Under the v5 gate * rms_normalize(mu) formulation, predictions enter the
+    backbone state and the task loss gradient reaches the prediction network
+    via: decoder -> backbone state -> conditioning gate * rms_normalize(mu) -> prediction_net.
+
+    Setting lambda_pred=0 disables the prediction loss; only task loss is active.
+    If prediction_net still gets gradients, the path through the backbone is confirmed.
     """
     torch.manual_seed(7)
     config = _pc_n2_config()
@@ -124,7 +76,7 @@ def test_task_loss_gradients_reach_prediction_network():
     task_loss.backward()
 
     # Prediction network parameters must have non-zero gradients arriving
-    # through the gate × (π × μ) → backbone → task-loss path.
+    # through the gate * rms_normalize(mu) -> backbone -> task-loss path.
     for name, param in core.pc_modules[0].prediction_net.named_parameters():
         assert param.grad is not None, (
             f"pc_modules[0].prediction_net.{name} has no gradient after task loss backward"

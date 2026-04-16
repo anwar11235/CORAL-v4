@@ -219,9 +219,31 @@ def main(cfg: DictConfig) -> None:
                     max_puzzles=config.training.quick_eval_samples,
                     dataset_name=config.data.dataset,
                 )
-                # Surface conditioning-gate evolution in every quick-eval log line.
-                for i, gate in enumerate(trainer.core.cond_gate):
-                    quick_metrics[f"cond_gate/level{i}"] = gate.item()
+                # Gate dynamics (v5 ConditioningGate) — mean/std/entropy per level.
+                # Run a mini forward pass on the first eval batch to get z_states.
+                # No grad_norm at quick-eval (no backward pass here).
+                try:
+                    _qe_batch = next(iter(eval_loader))
+                    _qe_inputs = _qe_batch["inputs"].to(device)[:8]  # tiny sample
+                    trainer.adapter.eval()
+                    trainer.core.eval()
+                    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                        _qe_z1 = trainer.adapter.encode(_qe_inputs)
+                        _qe_out = trainer.core(
+                            _qe_z1, K_max=1, training=False,
+                            decode_fn=trainer.adapter.decode,
+                            attention_masks=trainer._attention_masks,
+                        )
+                    for i, gate_mod in enumerate(trainer.core.conditioning_gates):
+                        g = gate_mod(_qe_out.z_states[i].float().to(next(gate_mod.parameters()).dtype))
+                        g_f = g.float()
+                        eps_g = 1e-7
+                        entropy = -(g_f * torch.log(g_f + eps_g) + (1 - g_f) * torch.log(1 - g_f + eps_g))
+                        quick_metrics[f"gate/level{i}_mean"] = g_f.mean().item()
+                        quick_metrics[f"gate/level{i}_std"] = g_f.std().item()
+                        quick_metrics[f"gate/level{i}_entropy"] = entropy.mean().item()
+                except Exception:
+                    pass  # gate metrics are optional; don't break training
                 # Precision dynamics — mirror training-step precision metrics at
                 # quick-eval granularity (every eval_every steps).
                 for i, pc in enumerate(trainer.core.pc_modules):
@@ -315,9 +337,13 @@ def _log_eval_diagnostics(trainer, out_dict):
         out_dict[f"prediction_error/level{i}_max"] = eps_rms.max().item()
         out_dict[f"precision_ema_var/level{i}_mean"] = ev.mean().item()
 
-    # Log learnable conditioning gate values
-    for i, gate in enumerate(trainer.core.cond_gate):
-        out_dict[f"cond_gate/level{i}"] = gate.item()
+    # Gate dynamics (v5 ConditioningGate) — mean/std/entropy per level.
+    # Pareto eval does not run a separate forward pass here; gate metrics are
+    # already captured in quick-eval and training-step logs.
+    # We emit per-parameter gate_bias as a proxy for gate openness.
+    for i, gate_mod in enumerate(trainer.core.conditioning_gates):
+        out_bias = gate_mod.net[-1].bias.detach().float()
+        out_dict[f"gate/level{i}_output_bias_mean"] = out_bias.mean().item()
 
 
 if __name__ == "__main__":

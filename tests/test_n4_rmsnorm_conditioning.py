@@ -1,9 +1,13 @@
 """Tests for Session N4: RMSNorm conditioning signal + NaN/Inf guard.
 
+Updated for v5: scalar cond_gate replaced by ConditioningGate MLP.
+RMSNorm at conditioning site is kept (N4). Precision removed from path (Phase 1).
+
 Verification criteria:
   - rms_normalize(μ) at conditioning site: scaling μ by 1000 produces the
-    same z_new as the unscaled version (scale invariance). The conditioning
-    contribution has RMS ≈ gate × π × 1.0, not gate × π × 1000.
+    same z_new as the unscaled version (scale invariance).
+  - Conditioning contribution to z_new is bounded by ~1.0 per feature
+    (sigmoid gate in (0,1) × rms_normalize output with RMS=1).
   - NaN loss raises RuntimeError with "Non-finite loss" before backward.
   - Inf loss raises RuntimeError with "Non-finite loss" before backward.
 """
@@ -76,22 +80,19 @@ def _make_batch():
 def test_conditioning_scale_invariant_under_rmsnorm():
     """Scaling μ by 1000 must produce the same z_new (rms_normalize is scale-invariant).
 
-    The level-0 conditioning injection is now:
-        z_new = z_backbone + gate × (π × rms_normalize(conditioning))
+    The v5 level-0 conditioning injection is:
+        gate = conditioning_gates[0](z_new)        # per-feature sigmoid in (0,1)
+        z_new = z_new + gate * rms_normalize(conditioning)
 
     rms_normalize(k × x) == rms_normalize(x) for any scalar k ≠ 0, so
     conditioning_large = 1000 × conditioning_unit must produce the same
-    z_new as conditioning_unit.  The backbone output z_backbone is identical
-    for both calls (backbone_in does not include conditioning).
+    z_new as conditioning_unit (gate is computed from z_new, which is the same
+    for both since backbone_in does not include conditioning).
     """
     torch.manual_seed(42)
     config = _pc_n2_config()
     core = CoralCore(config)
     core.eval()
-
-    # Pin gate=1.0 and pi=1.0 (ema_var=0.99 → pi = 1/(0.99+0.01) = 1.0)
-    core.cond_gate[0].data.fill_(1.0)
-    core.pc_modules[0].running_precision.ema_var.fill_(0.99)
 
     B, L, d0 = 1, 4, 64
     z = torch.zeros(B, L, d0)
@@ -113,24 +114,24 @@ def test_conditioning_scale_invariant_under_rmsnorm():
     )
 
 
-def test_conditioning_contribution_rms_is_gate_times_pi():
-    """The conditioning addition must have RMS ≈ gate × pi × 1.0, not gate × pi × 1000.
+def test_conditioning_contribution_bounded():
+    """Conditioning contribution to z_new is bounded by ~1.0 per feature (by construction).
 
-    With gate=1.0, pi=1.0:
-      z_backbone = _run_level(z, conditioning=None)
-      z_out      = _run_level(z, conditioning=large_tensor)
-      delta      = z_out - z_backbone  ← the conditioning addition
-      rms(delta) ≈ gate × pi × 1.0 = 1.0   (because rms_normalize bounds the signal)
+    v5 primitive: z_new = z_new + gate * rms_normalize(conditioning)
+    - gate = sigmoid(MLP(z_new)) in (0, 1) — bounded by construction
+    - rms_normalize(conditioning) has RMS ≈ 1.0 regardless of input scale
 
-    Before the N4 fix, rms(delta) would be ≈ 1000.0.
+    So delta = z_out - z_backbone satisfies delta_rms < 1.0 for any input magnitude.
+    With the at-init gate (~0.12), delta_rms ≈ 0.12. Even after max-gate training,
+    delta_rms < 1.0 by construction (sigmoid max < 1.0).
+
+    This test uses a conditioning tensor with RMS ≈ 1000 to confirm scale invariance
+    AND that the contribution is bounded well below 1000.
     """
     torch.manual_seed(0)
     config = _pc_n2_config()
     core = CoralCore(config)
     core.eval()
-
-    core.cond_gate[0].data.fill_(1.0)
-    core.pc_modules[0].running_precision.ema_var.fill_(0.99)  # pi = 1.0
 
     B, L, d0 = 2, 9, 64
     z = torch.zeros(B, L, d0)
@@ -148,14 +149,13 @@ def test_conditioning_contribution_rms_is_gate_times_pi():
     delta = z_out - z_backbone   # purely the conditioning addition
     delta_rms = delta.pow(2).mean(dim=-1).sqrt().mean().item()
 
-    # Expected: gate × pi × rms(rms_normalize(conditioning)) = 1.0 × 1.0 × 1.0 = 1.0
-    # Allow 10% tolerance as stated in the prompt.
-    expected = 1.0
-    assert abs(delta_rms - expected) / expected < 0.10, (
-        f"Conditioning contribution RMS should be ≈{expected:.1f} "
-        f"(gate=1, pi=1, rms_normalize output RMS=1), got {delta_rms:.4f}. "
-        f"If this is near 1000, RMSNorm is not being applied."
+    # gate in (0,1) * rms_normalize with RMS=1 => contribution << 1.0
+    # At init: gate ~ sigmoid(-2) ~ 0.12, so delta_rms ~ 0.12 (not 1000).
+    assert delta_rms < 1.0, (
+        f"Conditioning contribution RMS should be < 1.0 (sigmoid gate * RMSNorm = bounded), "
+        f"got {delta_rms:.4f}. If this is near 1000, RMSNorm is not being applied."
     )
+    assert delta_rms > 0.0, "Conditioning contribution must be non-zero (gate is not exactly 0)"
 
 
 # ---------------------------------------------------------------------------

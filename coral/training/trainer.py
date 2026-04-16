@@ -184,6 +184,27 @@ class TrainerV4:
             metrics[f"prediction_error/level{i}_max"] = eps_rms.max().item()
             metrics[f"precision_ema_var/level{i}_mean"] = ev.mean().item()
 
+        # Gate dynamics (v5 ConditioningGate) — mean/std/entropy/grad_norm per level.
+        # Uses the final z_state from the last segment as the gate context.
+        # grad_norm: L2 norm of gate MLP parameters' gradients (set after backward above).
+        for i, gate_mod in enumerate(self.core.conditioning_gates):
+            z_ref = output.z_states[i].detach().float()
+            with torch.no_grad():
+                g = gate_mod(z_ref.to(next(gate_mod.parameters()).dtype))
+            g_f = g.float()
+            eps_g = 1e-7
+            entropy = -(g_f * torch.log(g_f + eps_g) + (1 - g_f) * torch.log(1 - g_f + eps_g))
+            metrics[f"gate/level{i}_mean"] = g_f.mean().item()
+            metrics[f"gate/level{i}_std"] = g_f.std().item()
+            metrics[f"gate/level{i}_entropy"] = entropy.mean().item()
+            # Gradient magnitude: check that task loss gradient reaches the gate MLP.
+            grad_sq_sum = sum(
+                p.grad.detach().pow(2).sum().item()
+                for p in gate_mod.parameters()
+                if p.grad is not None
+            )
+            metrics[f"gate/level{i}_grad_norm"] = grad_sq_sum ** 0.5
+
         return metrics
 
     @torch.no_grad()
@@ -283,11 +304,20 @@ class TrainerV4:
             bypass_exact = (bypass_correct.sum(-1) == mask.sum(-1))
             metrics["crystal/bypass_accuracy"] = bypass_exact.float().mean().item()
 
-        # Conditioning gate values — one scalar per hierarchy level.
-        # Emitted unconditionally so gate evolution is visible in every eval
-        # log line regardless of whether Pareto eval has run yet.
-        for i, gate in enumerate(self.core.cond_gate):
-            metrics[f"cond_gate/level{i}"] = gate.item()
+        # Gate dynamics (v5 ConditioningGate) — mean/std/entropy per level.
+        # Emitted unconditionally so gate evolution is visible in every eval log.
+        for i, gate_mod in enumerate(self.core.conditioning_gates):
+            # Run a small forward pass through the gate using the final z_state
+            # of this level as context. No gradient needed (eval context).
+            z_ref = output.z_states[i].detach().float()
+            with torch.no_grad():
+                g = gate_mod(z_ref.to(next(gate_mod.parameters()).dtype))
+            g_f = g.float()
+            eps = 1e-7
+            entropy = -(g_f * torch.log(g_f + eps) + (1 - g_f) * torch.log(1 - g_f + eps))
+            metrics[f"gate/level{i}_mean"] = g_f.mean().item()
+            metrics[f"gate/level{i}_std"] = g_f.std().item()
+            metrics[f"gate/level{i}_entropy"] = entropy.mean().item()
 
         return metrics
 

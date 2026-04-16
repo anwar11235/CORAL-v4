@@ -17,9 +17,9 @@ Five diagnostics collected at each checkpoint:
         < 1 → mu is LESS varied than z1, confirming the blurring hypothesis.
         > 1 → mu is MORE varied (unusual — would sharpen representations).
 
-  [3] Gate magnitudes
-        cond_gate[0] (level-0 correction strength) and cond_gate[1] (level-1).
-        Initialised to 1.0; a large positive value amplifies the blur.
+  [3] Gate dynamics
+        v5 ConditioningGate MLP mean activation per level.
+        Initialised to ~0.12 (sigmoid(-2)); grows as the gate learns to open.
 
   [4] Conditioning magnitude relative to z1
         ||gate * (mu - z1)|| / ||z1|| averaged over all positions.
@@ -214,8 +214,15 @@ def run_diagnostic(
     # =========================================================
     # [3] Gate values.
     # =========================================================
-    gate_0 = core.cond_gate[0].item()
-    gate_1 = core.cond_gate[1].item()
+    # v5: ConditioningGate MLP — compute mean gate activation from current z1 as context.
+    with torch.no_grad():
+        gate_mod_0 = core.conditioning_gates[0]
+        gate_mod_1 = core.conditioning_gates[1]
+        g0 = torch.sigmoid(gate_mod_0.net(z1.float().mean(dim=1)))  # [B, d0]
+        g1_in = torch.zeros(z1.size(0), core.level_dims[1], device=z1.device)
+        g1 = torch.sigmoid(gate_mod_1.net(g1_in.float()))            # [B, d1]
+        gate_0 = g0.mean().item()
+        gate_1 = g1.mean().item()
 
     # =========================================================
     # [4] Conditioning magnitude relative to z1.
@@ -313,13 +320,13 @@ def print_diagnostic(r: Dict) -> None:
         interp = "SHARPENED — mu more varied than z1 (unusual)"
     print(f"    blur ratio (mu/z1): {br:.4f}  ←  {interp}")
 
-    print("\n[3] Conditioning gate values (init = 1.0):")
-    print(f"    cond_gate[0] (level-0): {r['gate_0']:.4f}")
-    print(f"    cond_gate[1] (level-1): {r['gate_1']:.4f}")
-    if r['gate_0'] > 1.5:
-        print("    ⚠  gate_0 > 1.5 — correction is being AMPLIFIED")
-    elif r['gate_0'] < 0.1:
-        print("    gate_0 < 0.1 — model has largely learned to suppress conditioning")
+    print("\n[3] v5 ConditioningGate mean activations (init ~ sigmoid(-2) ~ 0.12):")
+    print(f"    gate_mean[0] (level-0): {r['gate_0']:.4f}")
+    print(f"    gate_mean[1] (level-1): {r['gate_1']:.4f}")
+    if r['gate_0'] > 0.5:
+        print("    gate_mean[0] > 0.5 — gate is more than half-open on average")
+    elif r['gate_0'] < 0.05:
+        print("    gate_mean[0] < 0.05 — gate is nearly closed (below init)")
 
     print("\n[4] Conditioning magnitude:")
     print(f"    ||z1||:              {r['z1_magnitude_absolute']:.4f}")

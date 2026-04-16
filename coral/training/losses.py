@@ -189,8 +189,6 @@ class CoralLoss(nn.Module):
 
         # ---- Predictive coding loss ----
         # v4.2: precision is a running-EMA constant (pi.detach() inside the loss fn).
-        # The precision regulariser (L_pi) has been removed — RunningPrecision has
-        # zero parameters and requires no regularisation.
         L_pred = torch.tensor(0.0, device=device)
 
         if self.config.use_predictive_coding and pred_errors and precisions:
@@ -203,6 +201,19 @@ class CoralLoss(nn.Module):
             L_pred = self.config.lambda_pred * L_pred
 
         breakdown["loss/prediction"] = L_pred
+
+        # ---- Precision regulariser (v5) ----
+        # Symmetric log-normal form, minimum at pi=1: L_pi = lambda_pi * (log pi)^2.
+        # Removed in v4.2; reintroduced in v5 after unbounded precision drift to 35+
+        # in N5 without it. Operates on the same precision values used in the
+        # prediction loss; precision stays in the loss path only (not conditioning).
+        L_pi = torch.tensor(0.0, device=device)
+        lambda_pi = getattr(self.config, "lambda_pi", 0.0)
+        if lambda_pi > 0 and precisions:
+            for pi in precisions.values():
+                pi_f = pi.float()
+                L_pi = L_pi + lambda_pi * (torch.log(pi_f + 1e-8) ** 2).mean()
+        breakdown["loss/precision_reg"] = L_pi
 
         # ---- Halting loss ----
         L_halt = torch.tensor(0.0, device=device)
@@ -249,7 +260,7 @@ class CoralLoss(nn.Module):
         breakdown["loss/crystallisation"] = L_crystal
 
         # ---- Total ----
-        total = L_task.float() + L_pred + L_halt + L_amort + L_crystal + L_commit
+        total = L_task.float() + L_pred + L_pi + L_halt + L_amort + L_crystal + L_commit
         breakdown["loss/total"] = total
 
         return total, breakdown

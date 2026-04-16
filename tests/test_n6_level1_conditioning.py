@@ -1,18 +1,17 @@
-"""Tests for Session N6: precision-gated conditioning at level 1.
+"""Tests for v5 conditioning at level 1 (updated from Session N6).
 
-N5 showed cond_gate/level1 bit-frozen at 0.0117 for the entire run.
-The cause was the pre-N3 self-erasing formula gate × (xi_up − z_in),
-which vanishes as z_in dominates xi_up by orders of magnitude.
+N6 fixed the self-erasing gate x (xi_up - z_in) formula.
+v5 replaces the scalar gate entirely with ConditioningGate MLP.
 
-N6 replaces the else-branch with gate × rms_normalize(xi_up):
-  - rms_normalize makes the injection scale-invariant (Scenario B)
-  - Precision weighting is implicit in xi_up = error_up_proj(pi_0 * eps_0)
-  - The self-erasing subtraction of z_in is removed
+Both levels now use the same formula:
+  gate = conditioning_gates[level_idx](z_new)    # per-feature sigmoid
+  z_new = z_new + gate * rms_normalize(conditioning)
 
 Verification criteria:
   1. Level-1 conditioning contribution is scale-invariant w.r.t. xi_up scale.
-  2. Level-0 conditioning fix (N4) is still working correctly.
-  3. cond_gate[1] receives a non-trivial gradient from the task loss.
+  2. Level-0 conditioning fix (N4) is still working correctly (regression).
+  3. conditioning_gates[1] MLP receives a non-trivial gradient from a loss on
+     z_states[1] — the within-segment gradient path is intact.
 """
 
 import torch
@@ -54,27 +53,21 @@ def _pc_n2_config() -> ModelConfig:
 def test_level1_conditioning_scale_invariant():
     """Scaling xi_up by 1000 must produce the same level-1 z_new.
 
-    Under gate × rms_normalize(xi_up), rms_normalize(k * xi_up) ==
-    rms_normalize(xi_up) for any scalar k ≠ 0, so the backbone output
-    at level 1 is independent of xi_up's absolute scale.
-
-    Before N6, the formula was gate × (xi_up − z_1): the xi_up term was
-    additive without normalisation, so a 1000× scaled xi_up would
-    produce a 1000× larger conditioning delta.
+    v5 formula: z_new = backbone(z) + gate(z_new) * rms_normalize(xi_up).
+    rms_normalize(k * xi_up) == rms_normalize(xi_up) for any scalar k != 0.
+    gate(z_new) is computed from z_new (same for both calls since backbone
+    input doesn't include conditioning), so the outputs must be identical.
     """
     torch.manual_seed(42)
     config = _pc_n2_config()
     core = CoralCore(config)
     core.eval()
 
-    # Fix gate=1.0 at level 1 for clean measurement
-    core.cond_gate[1].data.fill_(1.0)
-
     B, L, d1 = 1, 4, 32   # level-1 dim
     z1 = torch.zeros(B, L, d1)
 
     xi_up_unit = torch.randn(B, L, d1)
-    xi_up_large = xi_up_unit * 1000.0   # same direction, 1000× scale
+    xi_up_large = xi_up_unit * 1000.0   # same direction, 1000x scale
 
     with torch.no_grad():
         z_out_unit  = core._run_level(z1.clone(), level_idx=1, n_steps=1,
@@ -85,31 +78,26 @@ def test_level1_conditioning_scale_invariant():
     max_err = (z_out_large - z_out_unit).abs().max().item()
     assert max_err < 1e-4, (
         f"rms_normalize should make level-1 conditioning scale-invariant, "
-        f"but 1000× scaling produced max diff = {max_err:.6f}. "
-        f"If this is large, the N6 else-branch may still subtract z_in."
+        f"but 1000x scaling produced max diff = {max_err:.6f}. "
+        f"Check that rms_normalize is applied in the v5 conditioning formula."
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 2 — Level-0 fix (N4) still works correctly after N6
+# Test 2 — Level-0 fix (N4) still works correctly after v5 changes
 # ---------------------------------------------------------------------------
 
-def test_level0_conditioning_still_bounded_after_n6():
-    """N4's rms_normalize at level 0 must be unaffected by the N6 change.
+def test_level0_conditioning_still_bounded_after_v5():
+    """N4's rms_normalize at level 0 must be unaffected by the v5 changes.
 
-    Set gate=1.0, pi=1.0 at level 0.  Inject a conditioning signal with
-    RMS ≈ 1000.  The conditioning delta (z_out − z_backbone) must have
-    RMS ≈ gate × pi × 1.0 = 1.0, not 1000.  This is the same assertion
-    as N4's test_conditioning_contribution_rms_is_gate_times_pi —
-    run here as a regression guard.
+    Inject a conditioning signal with RMS ~ 1000 at level 0. The conditioning
+    delta (z_out - z_backbone) must be << 1000 (bounded by sigmoid gate * RMSNorm).
+    At init, gate ~ sigmoid(-2) ~ 0.12, so delta_rms ~ 0.12.
     """
     torch.manual_seed(0)
     config = _pc_n2_config()
     core = CoralCore(config)
     core.eval()
-
-    core.cond_gate[0].data.fill_(1.0)
-    core.pc_modules[0].running_precision.ema_var.fill_(0.99)  # pi = 1.0
 
     B, L, d0 = 2, 9, 64
     z = torch.zeros(B, L, d0)
@@ -126,60 +114,55 @@ def test_level0_conditioning_still_bounded_after_n6():
     delta = z_out - z_backbone
     delta_rms = delta.pow(2).mean(dim=-1).sqrt().mean().item()
 
-    assert abs(delta_rms - 1.0) / 1.0 < 0.10, (
-        f"Level-0 conditioning RMS should still be ≈1.0 (N4 regression). "
-        f"Got {delta_rms:.4f}. N6 may have accidentally altered the level-0 branch."
+    assert delta_rms < 1.0, (
+        f"Level-0 conditioning delta_rms should be < 1.0 (sigmoid gate * RMSNorm). "
+        f"Got {delta_rms:.4f}. v5 changes may have broken the level-0 path."
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — cond_gate[1] is correctly wired into the computation graph
+# Test 3 — conditioning_gates[1] MLP is in the computation graph
 # ---------------------------------------------------------------------------
 
 def test_level1_gate_in_computation_graph():
-    """cond_gate[1] must receive a gradient from any loss on z_states[1].
+    """conditioning_gates[1] MLP parameters must receive gradients from a loss on z_states[1].
 
-    In the current architecture, z_states[1] is not decoded to logits —
-    the task loss decodes from z_states[0].  The only path where cond_gate[1]
-    receives real training signal is via a loss that flows through z_states[1]
-    directly (e.g. a future prediction loss at level 1).
+    v5 formula at level 1:
+      gate = conditioning_gates[1](z_new)    # gate net takes z_new as input
+      z_out = z_new + gate * rms_normalize(xi_up)
 
-    This test verifies that the N6 formula correctly connects cond_gate[1]
-    into the computation graph: when xi_up has a gradient and a synthetic
-    loss is placed on z_states[1], the gradient propagates to cond_gate[1].
+    The path from z_out -> gate -> gate_net parameters is:
+      loss(z_out) -> d(z_out)/d(gate) -> d(gate)/d(gate_net.parameters)
 
-    The prior formula gate × (xi_up − z_in) also participated in the graph
-    via z_in, but the signal was dominated by z_in's large magnitude.  The
-    N6 formula gate × rms_normalize(xi_up) provides a cleaner, scale-invariant
-    signal whenever z_states[1] is directly supervised.
+    This is the within-segment gradient path. v4's scalar cond_gate[1] had
+    an effectively-severed gradient path from the task loss (N6 finding).
+    The v5 gate MLP gets gradient via this direct path.
     """
     torch.manual_seed(7)
     config = _pc_n2_config()
     core = CoralCore(config)
 
-    # Pin gate=1.0 for clean measurement
-    core.cond_gate[1].data.fill_(1.0)
-
     B, L, d1 = 2, 4, 32  # level-1 dim
     z1 = torch.zeros(B, L, d1)
 
-    # xi_up = conditioning for level 1; give it requires_grad so the path
-    # through rms_normalize(xi_up) → z_out → loss → cond_gate[1] is exercised.
+    # xi_up = conditioning for level 1
     xi_up = torch.randn(B, L, d1, requires_grad=True)
 
-    # Run level 1 with the N6 formula: z_out = backbone(z1) + cond_gate[1] * rms_norm(xi_up)
+    # Run level 1: z_out = backbone(z1) + gate(z_new) * rms_normalize(xi_up)
     z_out = core._run_level(z1, level_idx=1, n_steps=1, conditioning=xi_up)
 
-    # Synthetic loss on z_states[1] — simulates any future supervision on level-1 state
+    # Synthetic loss on z_states[1]
     synthetic_loss = z_out.pow(2).mean()
     synthetic_loss.backward()
 
-    gate1 = core.cond_gate[1]
-    assert gate1.grad is not None, (
-        "cond_gate[1] has no gradient from a loss on z_states[1]. "
-        "The N6 rms_normalize(xi_up) term must appear in the computation graph."
+    gate_mod = core.conditioning_gates[1]
+    grads = [p.grad for p in gate_mod.parameters() if p.grad is not None]
+    assert len(grads) > 0, (
+        "conditioning_gates[1] MLP has no parameter gradients from a loss on z_states[1]. "
+        "The within-segment gradient path may be broken."
     )
-    assert gate1.grad.abs().max() > 1e-6, (
-        f"cond_gate[1] gradient is effectively zero: {gate1.grad.abs().max().item():.2e}. "
-        f"Expected non-trivial gradient via gate × rms_normalize(xi_up) → z_out → loss."
+    max_grad = max(g.abs().max().item() for g in grads)
+    assert max_grad > 1e-6, (
+        f"conditioning_gates[1] gradient is effectively zero: max={max_grad:.2e}. "
+        f"Expected non-trivial gradient via gate(z_new) * rms_normalize(xi_up) -> z_out -> loss."
     )

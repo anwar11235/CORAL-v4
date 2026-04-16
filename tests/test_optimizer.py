@@ -2,10 +2,11 @@
 
 Verifies that build_optimizer correctly separates:
   - Embedding weights (token_emb, pos_emb, level, timescale) → no_decay (WD=0)
-  - Bias parameters (1-d tensors) → no_decay (WD=0)
-  - Scalar learnable params (cond_gate, row_bias, col_bias, box_bias) → no_decay (WD=0)
+  - Bias parameters (1-d tensors, including gate MLP biases) → no_decay (WD=0)
+  - Scalar learnable params (row_bias, col_bias, box_bias) → no_decay (WD=0)
   - RMSNorm / LayerNorm parameters → no_decay (WD=0)
   - Backbone linear weights (q_proj, k_proj, etc.) → decay (WD=weight_decay)
+  - conditioning_gate MLP weights (2-d) → decay; biases → no_decay
   - Decoder linear weight → decay (WD=weight_decay)
 """
 
@@ -103,12 +104,16 @@ def test_row_col_box_bias_scalars_in_no_decay():
         )
 
 
-def test_cond_gate_in_no_decay():
-    """core.cond_gate (shape [1], ndim=1) must be in the no-decay group."""
+def test_conditioning_gate_biases_in_no_decay():
+    """conditioning_gates MLP biases (ndim=1, name ends in .bias) must be in the no-decay group.
+
+    The gate MLP weights (ndim=2) go to decay; biases (ndim=1) go to no_decay.
+    This replaces the old test_cond_gate_in_no_decay (v4 scalar cond_gate removed in v5).
+    """
     _, no_decay, _ = _get_param_groups()
-    matches = [n for n in no_decay if "cond_gate" in n]
+    matches = [n for n in no_decay if "conditioning_gates" in n and "bias" in n]
     assert len(matches) > 0, (
-        f"cond_gate not found in no_decay group. no_decay={sorted(no_decay)}"
+        f"conditioning_gates bias not found in no_decay group. no_decay={sorted(no_decay)}"
     )
 
 
